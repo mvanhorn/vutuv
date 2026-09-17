@@ -1871,11 +1871,22 @@ defmodule VutuvWeb.PostComponents do
       |> assign(:body?, presence?(text))
       |> assign(:html, Markdown.render_remote(text))
       |> assign(:tags, remote_tag_chips(hashtags))
+      |> assign(:warning_id, assigns.body_id && assigns.body_id <> "-warning")
 
+    # The lid keeps the reader's open state across a patch (issue #2200) only
+    # with an id: morphdom pairs an id-less `<details>` by position, and a lid
+    # opened on one post must never come up open on another. The id is the
+    # body's, which every card keys on its own subject, the same key its
+    # `RemoteActionsComponent` id makes unique on a page.
     ~H"""
     <div :if={@warning || @body? || @tags != []} data-nosnippet class="mt-1.5">
       <%= if @warning do %>
-        <details data-remote-warning class="group">
+        <details
+          id={@warning_id}
+          data-keep-open={@warning_id != nil}
+          data-remote-warning
+          class="group"
+        >
           <summary class="flex min-h-10 cursor-pointer list-none items-center gap-1 text-sm font-medium text-slate-700 dark:text-slate-300">
             <span aria-hidden="true">⚠</span>
             <span class="min-w-0 break-words">{@warning}</span>
@@ -2894,8 +2905,17 @@ defmodule VutuvWeb.PostComponents do
             there is one (a blur needs no detail, and never an SD/HD switch,
             which would offer to sharpen what is covered), the picture behind
             it takes the pair. --%>
+            <%!-- Keyed on the post and the picture, for the reason the content
+            warning's lid is keyed (`remote_body/1`): a picture the reader
+            uncovered must never come up uncovered on another post. --%>
             <% picture = RemoteMedia.picture(image) %>
-            <details data-remote-image-sensitive class="group relative">
+            <% lid_id = sensitive_lid_id(image) %>
+            <details
+              id={lid_id}
+              data-keep-open={lid_id != nil}
+              data-remote-image-sensitive
+              class="group relative"
+            >
               <%!-- The cover is inside the summary, so it must take itself away
               when the picture is shown: a `<summary>` renders open or closed
               alike, and without the `group-open:hidden` the blurred cover simply
@@ -2946,6 +2966,15 @@ defmodule VutuvWeb.PostComponents do
     </p>
     """
   end
+
+  # A covered picture's lid id: the post and the picture, both stored, so no two
+  # posts share one. An unsaved picture has no id and gets no lid id, and with
+  # it no `data-keep-open`.
+  defp sensitive_lid_id(%RemoteImage{id: id, remote_post_id: post_id})
+       when is_binary(id) and is_binary(post_id),
+       do: "remote-post-#{post_id}-picture-#{id}"
+
+  defp sensitive_lid_id(_image), do: nil
 
   # Whether there is a body to render at all. A post from an account somebody
   # follows can be a photograph and nothing else (issue #1163) — the picture is
@@ -3707,62 +3736,73 @@ defmodule VutuvWeb.PostComponents do
 
   # The provenance line when several servers carried one post (issue #2163).
   # Deliberately the geometry of `fediverse_details/1`, down to sharing its
-  # summary row: a reader who has opened one of those has opened this one.
-  #
-  # No `data-keep-open`: this card is a stream row, and the disclosure's state
-  # would only be lost to a patch the server sent for this very card, which on
-  # a page holding no action bar means a report or a reload — both of which
-  # redraw the card anyway.
+  # fold: a reader who has opened one of those has opened this one.
   defp external_servers(assigns) do
     ~H"""
-    <details
-      class="group mt-0.5 text-xs text-slate-600 dark:text-slate-400"
-      data-external-servers={length(@servers)}
-    >
-      <.fold_summary label={gettext("Found through these servers")} count={length(@servers)} />
-
-      <ul id={"external-servers-#{@id}"} class="flex flex-wrap gap-x-3 gap-y-1 px-2 pb-2 pt-1">
-        <li :for={server <- @servers} data-external-source={server} class="min-w-0 truncate">
-          {server}
-        </li>
-      </ul>
-    </details>
+    <div class="mt-0.5 text-xs" data-external-servers={length(@servers)}>
+      <.card_fold
+        id={"external-servers-fold-#{@id}"}
+        label={gettext("Found through these servers")}
+        count={length(@servers)}
+      >
+        <ul id={"external-servers-#{@id}"} class="flex flex-wrap gap-x-3 gap-y-1 px-2 pb-2 pt-1">
+          <li :for={server <- @servers} data-external-source={server} class="min-w-0 truncate">
+            {server}
+          </li>
+        </ul>
+      </.card_fold>
+    </div>
     """
   end
 
+  attr(:id, :string, required: true)
   attr(:label, :string, required: true)
   attr(:count, :integer, required: true)
+  slot(:inner_block, required: true)
 
-  # The one row a card folds something away behind: the globe, what is folded,
+  # The one fold a card puts something away behind: the globe, what is folded,
   # how many of it, and the chevron that turns. Two wearers so far — what other
   # networks did with one of our posts, and which servers carried one of theirs
   # — and they are the same gesture, so they are one recipe rather than two that
   # drift. `min-h-10` because on both cards this is the control a phone reader
   # is meant to open.
-  defp fold_summary(assigns) do
+  #
+  # The recipe owns the `<details>` and not only its summary, because that is
+  # where `data-keep-open` has to sit (issue #2200): a patch that re-sends the
+  # card (the day rolling over re-inserts every one) folded an open panel shut
+  # under its reader. The marker comes with an id, as on every lid that wears
+  # it: morphdom pairs an id-less `<details>` by position, so a panel opened on
+  # one post could come up open on another. Where the fold stands and what it
+  # carries is the caller's wrapper, which keeps every class here a literal
+  # that a stream insert does not have to send again.
+  defp card_fold(assigns) do
     ~H"""
-    <summary class="-mx-2 flex min-h-10 cursor-pointer list-none items-center gap-2 rounded-lg px-2 hover:bg-slate-100 dark:hover:bg-slate-800 [&::-webkit-details-marker]:hidden">
-      <span aria-hidden="true">🌐</span>
-      <span>{@label}</span>
-      <%!-- slate-200/700, a step off the row's own hover tint, so the pill
-            stays a pill while the summary is hovered or open. The dark text
-            step is the pill's own: the row's inherited `slate-400` reads 3.9
-            against `slate-700`, under AA, because the pill is lighter than
-            the card the row was coloured for. --%>
-      <span class="rounded-full bg-slate-200 px-1.5 text-xs font-semibold tabular-nums dark:bg-slate-700 dark:text-slate-200">
-        {compact_count(@count)}
-      </span>
-      <svg
-        class="ml-auto h-4 w-4 shrink-0 transition-transform group-open:rotate-180"
-        fill="none"
-        stroke="currentColor"
-        stroke-width="2"
-        viewBox="0 0 24 24"
-        aria-hidden="true"
-      >
-        <path stroke-linecap="round" stroke-linejoin="round" d="m19 9-7 7-7-7" />
-      </svg>
-    </summary>
+    <details id={@id} data-keep-open class="group text-slate-600 dark:text-slate-400">
+      <summary class="-mx-2 flex min-h-10 cursor-pointer list-none items-center gap-2 rounded-lg px-2 hover:bg-slate-100 dark:hover:bg-slate-800 [&::-webkit-details-marker]:hidden">
+        <span aria-hidden="true">🌐</span>
+        <span>{@label}</span>
+        <%!-- slate-200/700, a step off the row's own hover tint, so the pill
+              stays a pill while the summary is hovered or open. The dark text
+              step is the pill's own: the row's inherited `slate-400` reads 3.9
+              against `slate-700`, under AA, because the pill is lighter than
+              the card the row was coloured for. --%>
+        <span class="rounded-full bg-slate-200 px-1.5 text-xs font-semibold tabular-nums dark:bg-slate-700 dark:text-slate-200">
+          {compact_count(@count)}
+        </span>
+        <svg
+          class="ml-auto h-4 w-4 shrink-0 transition-transform group-open:rotate-180"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          viewBox="0 0 24 24"
+          aria-hidden="true"
+        >
+          <path stroke-linecap="round" stroke-linejoin="round" d="m19 9-7 7-7-7" />
+        </svg>
+      </summary>
+
+      {render_slot(@inner_block)}
+    </details>
     """
   end
 
@@ -7123,6 +7163,7 @@ defmodule VutuvWeb.PostComponents do
 
     <.fediverse_details
       :if={@engagement}
+      id={@id <> "-fediverse"}
       likes={Map.get(@engagement, :fediverse_likes) || 0}
       reposts={Map.get(@engagement, :fediverse_reposts) || 0}
       replies={Map.get(@engagement, :fediverse_replies) || 0}
@@ -7158,6 +7199,7 @@ defmodule VutuvWeb.PostComponents do
   # a post nobody out there touched stays clean. The reply figure counts
   # **public** replies only, so a note addressed to the member alone (issue
   # #1071) never moves a number a stranger can read.
+  attr(:id, :string, required: true, doc: "the fold's id, unique to this bar")
   attr(:likes, :integer, required: true)
   attr(:reposts, :integer, required: true)
   attr(:replies, :integer, required: true)
@@ -7176,14 +7218,13 @@ defmodule VutuvWeb.PostComponents do
       |> assign(:more, reactions - length(shown))
 
     ~H"""
-    <details
-      class="group mt-2 border-t border-slate-100 pt-1 text-sm text-slate-600 dark:border-slate-800 dark:text-slate-400"
+    <div
+      class="mt-2 border-t border-slate-100 pt-1 text-sm dark:border-slate-800"
       data-fediverse-details
       data-fediverse-reactions={@reactions}
       data-fediverse-replies={@replies}
     >
-      <.fold_summary label={gettext("From other networks")} count={@total} />
-
+    <.card_fold id={@id} label={gettext("From other networks")} count={@total}>
       <div class="space-y-2 px-2 pb-2 pt-1">
         <%!-- The split, in the same order and with the same glyphs as the
               buttons above, so each figure is obviously part of one of them. --%>
@@ -7243,7 +7284,8 @@ defmodule VutuvWeb.PostComponents do
 
         <p class="text-xs">{gettext("Already counted in the numbers above.")}</p>
       </div>
-    </details>
+    </.card_fold>
+    </div>
     """
   end
 

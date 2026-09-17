@@ -55,6 +55,7 @@ defmodule Vutuv.Tags.ExternalPosts do
   alias Vutuv.Tags.ExternalFetch
   alias Vutuv.Tags.ExternalPost
   alias Vutuv.Tags.ExternalTagClient
+  alias Vutuv.Tags.SourceServers
   alias Vutuv.Tags.Tag
   alias Vutuv.Tags.TagFollow
   alias Vutuv.Tags.TagFollowSource
@@ -104,6 +105,14 @@ defmodule Vutuv.Tags.ExternalPosts do
   # answers a narrower question than the one it was asked.
   @fold_scan 3_000
 
+  # An address that is plainly a web address, as a Postgres regex matched
+  # case-insensitively: a scheme, a host of letters, digits, dots and hyphens,
+  # a port, and a path of the characters RFC 3986 allows unescaped — no query,
+  # no fragment, no login. Strictly narrower than
+  # `Vutuv.ChangesetHelpers.web_url?/1`, so it can only send a good row to the
+  # predicate, never wave a bad one past it (`drop_unbacked/0`).
+  @plain_address "^https?://[a-z0-9.-]+(:[0-9]{1,5})?(/[a-z0-9._~!$&'()*+,;=:@%/-]*)?$"
+
   # --- What anybody may read (issue #2127) ----------------------------------
 
   @doc """
@@ -129,6 +138,10 @@ defmodule Vutuv.Tags.ExternalPosts do
   codebase is protected by — an ingest gate and a purge, never a read-path join
   — and "a blocked server leaves nothing at rest" is the stronger of the two
   promises anyway.
+
+  **Nor is who may speak for an author** (issues #2174 and #2199), for the same
+  reason: the pull refuses such a status and `drop_unbacked/0` takes such a row
+  out of the table, so a read never has to ask.
 
   Composable, and named `:external` so a caller can add its own clauses.
   """
@@ -642,25 +655,28 @@ defmodule Vutuv.Tags.ExternalPosts do
     end
   end
 
+  # A row whose server cannot speak for its author is answered as gone: the
+  # next `drop_unbacked/0` takes it, and filing it would put a report in the
+  # operator's ledger against the server a stranger named.
   defp take_down(post_id, %User{} = reporter) do
-    case UUIDv7.with_cast(post_id, &Repo.get(ExternalPost, &1)) do
-      %ExternalPost{reported_at: nil} = post ->
-        post |> copy_ids() |> blank()
+    with %ExternalPost{reported_at: nil} = post <-
+           UUIDv7.with_cast(post_id, &Repo.get(ExternalPost, &1)),
+         true <- ExternalPost.speaks_for_author?(post, SourceServers.relays()) do
+      post |> copy_ids() |> blank()
 
-        Fediverse.log_reported_post(%{
-          host: post.author_host || post.source,
-          # The author's own address where the server gave us one, the post's
-          # otherwise: the ledger keeps only a keyed digest of it, and a digest
-          # of nothing cannot be computed.
-          actor_uri: post.author_url || post.url,
-          audience: "public",
-          actor_id: reporter.id
-        })
+      Fediverse.log_reported_post(%{
+        host: post.author_host || post.source,
+        # The author's own address where the server gave us one, the post's
+        # otherwise: the ledger keeps only a keyed digest of it, and a digest
+        # of nothing cannot be computed.
+        actor_uri: post.author_url || post.url,
+        audience: "public",
+        actor_id: reporter.id
+      })
 
-        {:ok, report_scope(post)}
-
-      _gone_or_already_reported ->
-        {:error, :not_found}
+      {:ok, report_scope(post)}
+    else
+      _gone_reported_or_unbacked -> {:error, :not_found}
     end
   end
 
@@ -1137,21 +1153,68 @@ defmodule Vutuv.Tags.ExternalPosts do
     hosts = Fediverse.own_hosts()
     patterns = hosts |> Enum.map(&("%" <> Fediverse.strip_www(&1) <> "%")) |> Enum.uniq()
 
-    ids =
-      from(p in ExternalPost,
-        where:
-          p.author_host in ^hosts or
-            fragment("lower(?) like any(?)", p.url, type(^patterns, {:array, :string})),
-        select: %{id: p.id, author_host: p.author_host, url: p.url}
-      )
-      |> Repo.all()
-      |> Enum.filter(&ExternalPost.written_here?(&1.author_host, &1.url))
-      |> Enum.map(& &1.id)
+    from(p in ExternalPost,
+      where:
+        p.author_host in ^hosts or
+          fragment("lower(?) like any(?)", p.url, type(^patterns, {:array, :string})),
+      select: %{id: p.id, author_host: p.author_host, url: p.url}
+    )
+    |> Repo.all()
+    |> Enum.filter(&ExternalPost.written_here?(&1.author_host, &1.url))
+    |> delete_rows()
+  end
 
-    case ids do
-      [] -> 0
-      ids -> Repo.delete_all(from(p in ExternalPost, where: p.id in ^ids)) |> elem(0)
-    end
+  @doc """
+  Takes out every row whose server may not speak for its author
+  (`ExternalPost.speaks_for_author?/2`, issues #2174 and #2199). Answers how
+  many went.
+
+  **Trust is kept at rest, not asked on every read.** The pull refuses such a
+  status on the way in; this is for the rows that got in anyway — filed before
+  the rule, filed by the previous release during a blue/green window, or filed
+  by a server the operator has since taken off `TAG_SOURCE_SERVERS`. That list
+  only changes with a restart, which is why `Vutuv.Tags.ExternalPostFetcher`
+  runs this once at boot as well as beside `drop_written_here/0` on every tick.
+  Every surface then draws what is in the table.
+
+  **A reported row stays**: it draws nothing, and it is the tombstone that keeps
+  the report standing should the operator list that server later — the reason
+  `trim/2` never deletes one either. `report/2` files no new one on such a row.
+
+  **SQL narrows, the predicate decides**, as in `drop_written_here/0`. A row a
+  listed relay filed passes unless one of its addresses might read differently
+  in a browser, so the prefilter takes every other server's rows plus every row
+  with an address that is not plainly one: `@plain_address` accepts only what
+  `Vutuv.ChangesetHelpers.web_url?/1` accepts too, and whatever it turns away
+  goes to the predicate, which is where the answer comes from.
+  """
+  def drop_unbacked do
+    relays = SourceServers.relays()
+
+    from(p in ExternalPost,
+      where: is_nil(p.reported_at),
+      where:
+        p.source not in ^MapSet.to_list(relays) or
+          not fragment("? ~* ?", p.url, ^@plain_address) or
+          not fragment("coalesce(? ~* ?, true)", p.author_url, ^@plain_address),
+      select: %{
+        id: p.id,
+        source: p.source,
+        url: p.url,
+        author_host: p.author_host,
+        author_url: p.author_url
+      }
+    )
+    |> Repo.all()
+    |> Enum.reject(&ExternalPost.speaks_for_author?(&1, relays))
+    |> delete_rows()
+  end
+
+  defp delete_rows([]), do: 0
+
+  defp delete_rows(rows) do
+    ids = Enum.map(rows, & &1.id)
+    Repo.delete_all(from(p in ExternalPost, where: p.id in ^ids)) |> elem(0)
   end
 
   # Keeps the newest `cap` rows of `scope` and deletes the rest, by the keyset

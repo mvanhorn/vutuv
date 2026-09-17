@@ -7,8 +7,8 @@ defmodule Vutuv.Tags.TrendingTest do
   figures. The fixtures are those measurements shrunk to two servers.
 
   `async: false`: it flips `:fetch_external_tag_posts`, `:fetch_trending_tags`,
-  `:tag_source_servers` and `:external_tag_req_options`, every one of them
-  application env and therefore global.
+  `:tag_source_servers`, `:tag_trending` and `:external_tag_req_options`, every
+  one of them application env and therefore global.
   """
   use Vutuv.DataCase, async: false
 
@@ -21,6 +21,8 @@ defmodule Vutuv.Tags.TrendingTest do
   alias Vutuv.Tags.ExternalPosts
   alias Vutuv.Tags.TrendCheck
   alias Vutuv.Tags.Trending
+  alias Vutuv.Tags.TrendingTag
+  alias Vutuv.Tags.TrendVerdict
 
   @big "troet.example"
   @small "nrw.example"
@@ -83,13 +85,27 @@ defmodule Vutuv.Tags.TrendingTest do
 
       Trending.refresh()
 
-      assert [row] = Trending.offers()
+      assert [row] = Trending.offer().tags
       assert row.name == "warntag"
       assert row.servers == 2
       assert row.uses == 2 * 1084
       assert row.baseline == 2 * 3
       assert row.history == Enum.map(@warntag, &(&1 * 2))
       assert @big in row.hosts
+    end
+
+    # Issue #2209: an empty offer is either a quiet day or a reader who already
+    # follows everything that ran ahead, and the row says different things.
+    test "says whether the reader's own follows are what emptied the offer" do
+      spiking("warntag", @warntag, &crowd/1)
+      Trending.refresh()
+
+      assert %{tags: [_row], all_followed?: false} = Trending.offer()
+      assert %{tags: [], all_followed?: true} = Trending.offer(except: ["WarnTag"])
+      assert %{tags: [_row], all_followed?: false} = Trending.offer(except: ["xbox"])
+
+      Repo.delete_all(TrendingTag)
+      assert %{tags: [], all_followed?: false} = Trending.offer(except: ["warntag"])
     end
 
     test "a tag on one server alone is not offered" do
@@ -100,7 +116,7 @@ defmodule Vutuv.Tags.TrendingTest do
 
       Trending.refresh()
 
-      assert Trending.offers() == []
+      assert Trending.offer().tags == []
     end
 
     test "the seven-day history decides, not the raw volume" do
@@ -119,7 +135,7 @@ defmodule Vutuv.Tags.TrendingTest do
 
       Trending.refresh()
 
-      assert Enum.map(Trending.offers(), & &1.name) == ["warntag"]
+      assert Enum.map(Trending.offer().tags, & &1.name) == ["warntag"]
     end
   end
 
@@ -134,7 +150,7 @@ defmodule Vutuv.Tags.TrendingTest do
 
       Trending.refresh()
 
-      assert Trending.offers() == []
+      assert Trending.offer().tags == []
     end
 
     test "a tag whose posts are bot accounts is not offered" do
@@ -142,7 +158,7 @@ defmodule Vutuv.Tags.TrendingTest do
 
       Trending.refresh()
 
-      assert Trending.offers() == []
+      assert Trending.offer().tags == []
     end
 
     test "a tag with too small a sample to judge is not offered" do
@@ -153,7 +169,7 @@ defmodule Vutuv.Tags.TrendingTest do
 
       Trending.refresh()
 
-      assert Trending.offers() == []
+      assert Trending.offer().tags == []
     end
 
     test "a tag whose server will not show its timeline is not offered" do
@@ -168,7 +184,7 @@ defmodule Vutuv.Tags.TrendingTest do
 
       Trending.refresh()
 
-      assert Trending.offers() == []
+      assert Trending.offer().tags == []
     end
 
     test "a crowd over the same numbers is offered" do
@@ -177,7 +193,7 @@ defmodule Vutuv.Tags.TrendingTest do
 
       Trending.refresh()
 
-      assert [row] = Trending.offers()
+      assert [row] = Trending.offer().tags
       assert row.name == "mow4"
       assert row.author_hosts == 5
       assert row.bot_posts == 0
@@ -206,7 +222,7 @@ defmodule Vutuv.Tags.TrendingTest do
 
       Trending.refresh()
 
-      assert Trending.offers() == []
+      assert Trending.offer().tags == []
     end
 
     test "the same tag with a genuine fourth server is offered" do
@@ -216,7 +232,7 @@ defmodule Vutuv.Tags.TrendingTest do
 
       Trending.refresh()
 
-      assert [row] = Trending.offers()
+      assert [row] = Trending.offer().tags
       assert row.name == "warntag"
       # The stored figures are about strangers only — 16 statuses over four
       # servers, with our five nowhere in them.
@@ -236,7 +252,7 @@ defmodule Vutuv.Tags.TrendingTest do
 
       Trending.refresh()
 
-      assert Trending.offers() == []
+      assert Trending.offer().tags == []
     end
 
     test "our own posts do not water down the share that is bots" do
@@ -249,7 +265,278 @@ defmodule Vutuv.Tags.TrendingTest do
 
       Trending.refresh()
 
-      assert Trending.offers() == []
+      assert Trending.offer().tags == []
+    end
+  end
+
+  # Issue #2204: a server the operator shut out is no more a voice about a tag
+  # than it is a post under one. Each fixture puts the blocked server exactly
+  # where counting it would decide the verdict.
+  describe "a blocked instance is not one of the servers out there" do
+    @blocked "shouty.example"
+
+    setup do
+      Repo.insert!(%BlockedInstance{host: @blocked})
+      :ok
+    end
+
+    # Statuses from the blocked server, with ids apart from `sample_statuses/4`'s
+    # because the two lists are one timeline.
+    defp from_blocked(source, count, bots) do
+      source
+      |> sample_statuses(count, [@blocked], bots)
+      |> Enum.map(&Map.update!(&1, "id", fn id -> "blocked-#{id}" end))
+    end
+
+    defp spiking_with_blocked(sample), do: spiking("warntag", @warntag, sample)
+
+    test "a tag that reaches the fourth author server only through a blocked one is not offered" do
+      spiking_with_blocked(
+        &(sample_statuses(&1, 15, ~w(a.example b.example c.example)) ++ from_blocked(&1, 5, 0))
+      )
+
+      Trending.refresh()
+
+      assert Trending.offer().tags == []
+    end
+
+    test "a blocked server's bots do not make a crowd read as a wave" do
+      # Ten people over four servers beside twelve bots from the blocked one:
+      # counted, 12 of 22 is past the threshold and the crowd was dropped.
+      spiking_with_blocked(
+        &(sample_statuses(&1, 10, ~w(a.example b.example c.example d.example)) ++
+            from_blocked(&1, 12, 12))
+      )
+
+      Trending.refresh()
+
+      assert [row] = Trending.offer().tags
+      assert row.author_hosts == 4
+      assert row.bot_posts == 0
+      assert row.sampled == 10
+    end
+
+    test "a blocked server's people do not water down a wave" do
+      # Eight bots among ten posts is a wave; beside ten posts from the blocked
+      # server it read as 40 %.
+      spiking_with_blocked(
+        &(sample_statuses(&1, 10, ~w(a.example b.example c.example d.example), 8) ++
+            from_blocked(&1, 10, 0))
+      )
+
+      Trending.refresh()
+
+      assert Trending.offer().tags == []
+    end
+
+    test "a sample without a blocked server is judged as before" do
+      trends = [{"warntag", @warntag}, {"mow4", @mow4}]
+
+      samples = fn host ->
+        %{
+          "warntag" => crowd(host),
+          "mow4" => sample_statuses(host, 20, ~w(a.example b.example c.example d.example), 19)
+        }
+      end
+
+      stub(%{@big => trends, @small => trends}, %{
+        @big => samples.(@big),
+        @small => samples.(@small)
+      })
+
+      Trending.refresh()
+
+      assert [row] = Trending.offer().tags
+      assert row.name == "warntag"
+      assert row.author_hosts == 5
+      assert row.bot_posts == 0
+      assert row.sampled == 20
+    end
+  end
+
+  # Issue #2160: the census always asked a tag's busiest server, and one real
+  # pass put seven of its eighteen requests on mastodon.social.
+  describe "the census is spread over the servers that report a tag" do
+    @third "third.example"
+    @quieter [100, 1, 1, 1, 1, 1, 1]
+
+    # Everything the census asked this pass, as `{host, tag}`.
+    defp census_requests(acc \\ []) do
+      receive do
+        {:req, host, "/api/v1/timelines/tag/" <> name} -> census_requests([{host, name} | acc])
+        {:req, _host, _path} -> census_requests(acc)
+      after
+        0 -> acc
+      end
+    end
+
+    test "no server is asked more than its share, and the others carry the rest" do
+      put_config(:tag_source_servers, [@big, @small, @third])
+      put_config(:tag_trending, census_per_host: 2)
+
+      # Six equally loud candidates, every one busiest on the big server, three
+      # of them also listed by each smaller one. The big server alone could vet
+      # all six; its cap leaves it two.
+      first = ~w(alpha bravo charlie)
+      second = ~w(delta echo foxtrot)
+
+      stub(
+        %{
+          @big => Enum.map(first ++ second, &{&1, @warntag}),
+          @small => Enum.map(first, &{&1, @quieter}),
+          @third => Enum.map(second, &{&1, @quieter})
+        },
+        %{
+          @big => Map.new(first ++ second, &{&1, crowd(@big)}),
+          @small => Map.new(first, &{&1, crowd(@small)}),
+          @third => Map.new(second, &{&1, crowd(@third)})
+        }
+      )
+
+      Trending.refresh()
+
+      asked = census_requests()
+      per_host = Enum.frequencies_by(asked, &elem(&1, 0))
+
+      assert per_host == %{@big => 2, @small => 1, @third => 2}
+
+      # The last candidate is reported by two servers that have both had their
+      # share, so it waits for the next pass rather than being asked of either.
+      refute Enum.any?(asked, &match?({_host, "foxtrot"}, &1))
+
+      assert Trending.offer(limit: 10).tags |> Enum.map(& &1.name) |> Enum.sort() ==
+               ~w(alpha bravo charlie delta echo)
+    end
+  end
+
+  # The review of issue #2160's cap: every pass asked the loudest candidates
+  # again, so an installation reading one server never sampled more than two of
+  # them, and the row stayed empty for good when those two were bot waves.
+  describe "the census works through every candidate" do
+    @eight ~w(alpha bravo charlie delta echo foxtrot golf hotel)
+
+    setup do
+      put_config(:tag_source_servers, [@big])
+      put_config(:tag_trending, min_servers: 1, census_per_host: 2)
+      :ok
+    end
+
+    # Eight spiking candidates, loudest first. The loudest one's timeline is
+    # broken, so its census fails; the second is a bot wave; the rest are crowds.
+    defp eight_candidates do
+      trends =
+        @eight
+        |> Enum.with_index()
+        |> Enum.map(fn {name, index} -> {name, [900 - 50 * index, 1, 1, 1, 1, 1, 1]} end)
+
+      samples =
+        @eight
+        |> Map.new(&{&1, crowd(@big)})
+        |> Map.put("alpha", %{"error" => "not a timeline"})
+        |> Map.put("bravo", sample_statuses(@big, 20, ["farm.example"], 20))
+
+      stub(%{@big => trends}, %{@big => samples})
+    end
+
+    # One pass, then every verdict half an hour older, which is what the next
+    # pass would find. Answers who was sampled and what is offered afterwards.
+    defp census_pass do
+      Repo.delete_all(TrendCheck)
+      flush()
+      Trending.refresh()
+
+      asked = Enum.map(census_requests(), &elem(&1, 1))
+      assert asked == Enum.uniq(asked), "a candidate was sampled twice in one pass"
+
+      age_verdicts(30)
+      {Enum.sort(asked), offered_names()}
+    end
+
+    defp offered_names, do: Trending.offer(limit: 10).tags |> Enum.map(& &1.name) |> Enum.sort()
+
+    defp age_verdicts(minutes) do
+      Repo.update_all(
+        from(v in TrendVerdict,
+          update: [
+            set: [vetted_at: fragment("? - make_interval(mins => ?)", v.vetted_at, ^minutes)]
+          ]
+        ),
+        []
+      )
+    end
+
+    test "quieter candidates get their turn, and the offer keeps what passed" do
+      eight_candidates()
+
+      assert census_pass() == {~w(alpha bravo), []}
+      assert census_pass() == {~w(charlie delta), ~w(charlie delta)}
+      assert census_pass() == {~w(echo foxtrot), ~w(charlie delta echo foxtrot)}
+      assert census_pass() == {~w(golf hotel), ~w(charlie delta echo foxtrot golf hotel)}
+
+      # Everybody has a verdict now, so the oldest are asked again, the failed
+      # census among them, and nothing that passed drops off in the meantime.
+      assert census_pass() == {~w(alpha bravo), ~w(charlie delta echo foxtrot golf hotel)}
+      assert census_pass() == {~w(charlie delta), ~w(charlie delta echo foxtrot golf hotel)}
+    end
+
+    test "a verdict older than four passes is not offered on, and goes once its tag is quiet" do
+      eight_candidates()
+      census_pass()
+      assert {_asked, ~w(charlie delta)} = census_pass()
+
+      put_config(:tag_trending, min_servers: 1, census_per_host: 2, vet_limit: 0)
+      Repo.delete_all(TrendCheck)
+      Trending.refresh()
+      assert offered_names() == ~w(charlie delta)
+
+      age_verdicts(4 * 30)
+      Repo.delete_all(TrendCheck)
+      Trending.refresh()
+      assert offered_names() == []
+      assert Repo.aggregate(TrendVerdict, :count) == 4
+
+      stub(%{@big => []})
+      Repo.delete_all(TrendCheck)
+      Trending.refresh()
+      assert Repo.aggregate(TrendVerdict, :count) == 0
+    end
+  end
+
+  describe "the knobs" do
+    test "are read from the application env, and a key it does not name keeps its default" do
+      put_config(:tag_trending, min_servers: 1)
+
+      assert Trending.settings()[:min_servers] == 1
+      assert Trending.settings()[:min_uses] == 25
+      assert Trending.settings()[:census_per_host] == 2
+    end
+
+    test "an installation reading one server offers what spikes there once it says so" do
+      put_config(:tag_source_servers, [@big])
+      stub(%{@big => [{"warntag", @warntag}]}, %{@big => %{"warntag" => crowd(@big)}})
+
+      Trending.refresh()
+      assert Trending.offer().tags == []
+
+      put_config(:tag_trending, min_servers: 1)
+      Repo.delete_all(TrendCheck)
+      Trending.refresh()
+
+      assert [%{name: "warntag"}] = Trending.offer().tags
+    end
+
+    test "every one of them can be set from the environment and is documented" do
+      runtime = File.read!("config/runtime.exs")
+      admins = File.read!("docs/ADMINS.md")
+      named = Regex.scan(~r/\{"(TAG_TRENDING_[A-Z_]+)", :([a-z_]+)\}/, runtime)
+
+      assert named |> Enum.map(&Enum.at(&1, 2)) |> Enum.sort() ==
+               Trending.settings() |> Keyword.keys() |> Enum.map(&to_string/1) |> Enum.sort()
+
+      for [_match, name, _key] <- named do
+        assert admins =~ "| `#{name}` |",
+               "#{name} is missing from the env table in docs/ADMINS.md"
+      end
     end
   end
 
@@ -301,13 +588,13 @@ defmodule Vutuv.Tags.TrendingTest do
       )
 
       Trending.refresh()
-      assert [_row] = Trending.offers()
+      assert [_row] = Trending.offer().tags
 
       flush()
       Trending.refresh()
 
       refute_received {:req, _host, _path}
-      assert [_row] = Trending.offers()
+      assert [_row] = Trending.offer().tags
     end
   end
 
@@ -348,7 +635,7 @@ defmodule Vutuv.Tags.TrendingTest do
 
       assert Trending.refresh() == :disabled
       refute_received {:req, _host, _path}
-      assert Trending.offers() == []
+      assert Trending.offer().tags == []
       assert Trending.due_servers() == []
     end
 
@@ -367,7 +654,7 @@ defmodule Vutuv.Tags.TrendingTest do
       Trending.refresh()
 
       refute_received {:req, _host, _path}
-      assert Trending.offers() == []
+      assert Trending.offer().tags == []
     end
   end
 

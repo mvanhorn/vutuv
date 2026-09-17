@@ -36,6 +36,33 @@ defmodule Vutuv.Tags.ExternalTagClientTest do
   # over the same fixture.
   defp ours(attrs), do: our_status(@source, attrs)
 
+  # A status the answering server files under somebody living elsewhere — every
+  # honest relay has this shape, and so does issue #2174's forged card.
+  defp relayed(id) do
+    status(%{
+      "id" => id,
+      "url" => "https://real.example/@alice/#{id}",
+      "account" => %{
+        "acct" => "alice@real.example",
+        "display_name" => "Alice",
+        "url" => "https://real.example/@alice"
+      }
+    })
+  end
+
+  # A status whose two addresses name `source` to `URI.parse/1` and
+  # victim.example to a browser, which reads the backslash as a slash.
+  defp forged_home_copy(source) do
+    remote_status(source, %{
+      "id" => "1123",
+      "url" => "https://victim.example\\@#{source}/../@alice/1123",
+      "account" => %{
+        "acct" => "alice",
+        "url" => "https://victim.example\\@#{source}/../@alice"
+      }
+    })
+  end
+
   # Every Finch a pinned request started, by the name it registers under. Empty
   # is the claim: one instance lives for one request and is stopped in an
   # `after`, so nothing accumulates however many hostnames members name.
@@ -126,6 +153,26 @@ defmodule Vutuv.Tags.ExternalTagClientTest do
 
       assert {:ok, [post]} = ExternalTagClient.fetch(@source, "Elixir")
       assert post.remote_id == "2"
+    end
+
+    # Issue #2174's hand-over: the author's host is the answering server's word,
+    # so `www.` in front of a blocked name must not be a way past the block.
+    test "drops a status whose author lives at a blocked host's www. alias" do
+      admin = insert(:activated_user)
+      {:ok, {_blocked, _purged}} = Fediverse.block_instance(%{"host" => "shouty.example"}, admin)
+
+      {:ok, {_blocked, _purged}} =
+        Fediverse.block_instance(%{"host" => "www.loud.example"}, admin)
+
+      stub_tag_timeline([
+        status(%{"id" => "1", "account" => %{"acct" => "bob@www.shouty.example"}}),
+        status(%{"id" => "2", "account" => %{"acct" => "bob@WWW.www.Shouty.Example"}}),
+        status(%{"id" => "3", "account" => %{"acct" => "carol@www.loud.example"}}),
+        status(%{"id" => "4"})
+      ])
+
+      assert {:ok, [post]} = ExternalTagClient.fetch(@source, "Elixir")
+      assert post.remote_id == "4"
     end
 
     test "skips a sensitive status and one behind a content warning" do
@@ -286,6 +333,104 @@ defmodule Vutuv.Tags.ExternalTagClientTest do
     end
   end
 
+  # Issue #2174: a server a member typed in speaks for its own members only.
+  # What it says about anybody else's is one stranger's unverified word, and
+  # byte for byte the same as a card it invented.
+  describe "who may speak for an author" do
+    test "a server a member typed in brings nothing written elsewhere" do
+      put_config(:tag_source_servers, ["listed.example"])
+      stub_tag_timeline([relayed("1")])
+
+      assert ExternalTagClient.fetch(@source, "Elixir") == {:ok, []}
+    end
+
+    # Compared the way the source column is stored, so the operator's spelling
+    # of the list does not decide it.
+    test "a server the operator listed relays it" do
+      put_config(:tag_source_servers, ["https://WWW.Mastodon.Example/"])
+      stub_tag_timeline([relayed("1")])
+
+      assert {:ok, [post]} = ExternalTagClient.fetch(@source, "Elixir")
+      assert post.author_host == "real.example"
+      assert post.url == "https://real.example/@alice/1"
+    end
+
+    test "a server a member typed in still speaks for its own members" do
+      put_config(:tag_source_servers, [])
+
+      stub_tag_timeline([
+        status(%{
+          "id" => "2",
+          "url" => "https://#{@source}/@bob/2",
+          "account" => %{"acct" => "bob"}
+        }),
+        # Its own member by the acct, at an address on another server: not the
+        # post as its own server serves it.
+        status(%{
+          "id" => "3",
+          "url" => "https://real.example/@bob/3",
+          "account" => %{"acct" => "bob"}
+        })
+      ])
+
+      assert {:ok, [post]} = ExternalTagClient.fetch(@source, "Elixir")
+      assert post.remote_id == "2"
+    end
+
+    # The link under the name is part of the claim too: a server that links its
+    # member to somebody else's profile is not believed about that member at
+    # all. A listed relay's word stands, which keeps a split-domain server's real
+    # profile address.
+    test "a server a member typed in files nothing linking its member elsewhere" do
+      put_config(:tag_source_servers, [])
+
+      stub_tag_timeline([
+        status(%{
+          "id" => "2",
+          "account" => %{"acct" => "ada", "url" => "https://victim.example/@ada"}
+        }),
+        status(%{"id" => "3"})
+      ])
+
+      assert {:ok, [own]} = ExternalTagClient.fetch(@source, "Elixir")
+      assert own.remote_id == "3"
+      assert own.author_url == "https://#{@source}/@ada"
+
+      # The `put_config/2` above puts the shipped list back afterwards.
+      Application.put_env(:vutuv, :tag_source_servers, [@source])
+
+      stub_tag_timeline([
+        put_in(relayed("4"), ["account", "url"], "https://social.real.example/@alice")
+      ])
+
+      assert {:ok, [relay]} = ExternalTagClient.fetch(@source, "Elixir")
+      assert relay.author_url == "https://social.real.example/@alice"
+    end
+
+    # The review's case: `URI.parse/1` reads `evil.example` in both addresses,
+    # a browser reads `victim.example`, so the hand-typed server's "own member"
+    # was stored and drawn under the victim's profile.
+    test "an address a browser reads as another host is never filed" do
+      put_config(:tag_source_servers, [])
+      stub_tag_timeline([forged_home_copy("evil.example")])
+
+      assert ExternalTagClient.fetch("evil.example", "Elixir") == {:ok, []}
+    end
+
+    test "a listed relay files no such address either, and drops such a profile link" do
+      put_config(:tag_source_servers, [@source])
+
+      stub_tag_timeline([
+        forged_home_copy(@source),
+        put_in(relayed("5"), ["account", "url"], "https://user@real.example/@alice")
+      ])
+
+      assert {:ok, [post]} = ExternalTagClient.fetch(@source, "Elixir")
+      assert post.remote_id == "5"
+      assert post.author_url == nil
+    end
+  end
+
   # A post written here federates out with its hashtags, so the servers a
   # followed tag names carry it on their public tag timelines and hand it
   # straight back — as somebody else's find, under our own member's handle
@@ -311,6 +456,9 @@ defmodule Vutuv.Tags.ExternalTagClientTest do
     # The refusing direction only: a host that merely *contains* ours is another
     # server, and dropping its posts would be this bug with the sign flipped.
     test "a server whose name only looks like ours is still a find" do
+      # Relayed, so asked of a server the operator listed (issue #2174).
+      put_config(:tag_source_servers, [@source])
+
       stub_tag_timeline([
         ours(%{id: "neighbour", host: "not#{our_host()}"}),
         ours(%{id: "subdomain", host: "mirror.#{our_host()}"})
@@ -377,6 +525,35 @@ defmodule Vutuv.Tags.ExternalTagClientTest do
                %{host: "mirror.#{our_host()}", bot?: false},
                %{host: "elsewhere.test", bot?: true}
              ]
+    end
+
+    # Issue #2204: the same blocklist the pull reads, asked of the author.
+    test "leaves out an author whose server the operator blocked" do
+      admin = insert(:activated_user)
+      {:ok, {_blocked, _purged}} = Fediverse.block_instance(%{"host" => "shouty.example"}, admin)
+
+      stub_tag_timeline([
+        status(%{"id" => "1", "account" => %{"acct" => "bot@shouty.example", "bot" => true}}),
+        status(%{"id" => "2", "account" => %{"acct" => "bob@Shouty.Example"}}),
+        status(%{"id" => "3", "account" => %{"acct" => "carol@quiet.example"}}),
+        status(%{"id" => "4"})
+      ])
+
+      assert ExternalTagClient.authors(@source, "Elixir") ==
+               {:ok, [%{host: "quiet.example", bot?: false}, %{host: @source, bot?: false}]}
+    end
+
+    test "leaves out an author at the www. alias of a blocked server" do
+      admin = insert(:activated_user)
+      {:ok, {_blocked, _purged}} = Fediverse.block_instance(%{"host" => "shouty.example"}, admin)
+
+      stub_tag_timeline([
+        status(%{"id" => "1", "account" => %{"acct" => "bot@www.shouty.example", "bot" => true}}),
+        status(%{"id" => "2", "account" => %{"acct" => "carol@wwwshouty.example"}})
+      ])
+
+      assert ExternalTagClient.authors(@source, "Elixir") ==
+               {:ok, [%{host: "wwwshouty.example", bot?: false}]}
     end
   end
 end

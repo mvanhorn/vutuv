@@ -226,6 +226,18 @@ defmodule Vutuv.ExternalTagHelpers do
   def author_host, do: "mastodon.example"
 
   @doc """
+  Lists the servers these fixtures relay through, as an operator would with
+  `TAG_SOURCE_SERVERS`, for the rest of the test.
+
+  A server a member typed in speaks for its own members only (issue #2174), so
+  a relayed card — the ordinary case `tag_source/0` stands for — survives
+  `Vutuv.Tags.ExternalPosts.drop_unbacked/0` only when its server is on the list.
+  """
+  def list_fixture_relays do
+    put_config(:tag_source_servers, [tag_source(), "social.example", "hachyderm.example"])
+  end
+
+  @doc """
   What this installation calls itself in the test environment — the host a post
   written here carries when a stranger's timeline hands it back (issue #2179).
 
@@ -234,6 +246,17 @@ defmodule Vutuv.ExternalTagHelpers do
   raises.
   """
   def our_host, do: VutuvWeb.Endpoint.host()
+
+  @doc """
+  Selectors for the tag-source panel (issue #2128): a tag's chip, and a
+  server's switch and row. A hostname is not a DOM id, so the panel spells its
+  dots as dashes, and so do these, in one place for both of its hosts.
+  """
+  def source_chip(tag), do: "#tag-sources-chip-#{tag.id}"
+  def source_switch(host), do: "#tag-source-switch-#{dom_key(host)}"
+  def source_row(host), do: "#tag-source-#{dom_key(host)}"
+
+  defp dom_key(host), do: String.replace(host, ".", "-")
 
   @doc """
   A member following `tag` through `source` — the follow this whole feature

@@ -92,7 +92,10 @@ defmodule Vutuv.Tags.SourceServers do
   Empty when the feature is switched off, because a server we may not fetch from
   is not one to offer.
   """
-  def offered, do: offered(blocked_hosts(configured()))
+  def offered do
+    listed = configured()
+    offered(listed, blocked_hosts(listed))
+  end
 
   @doc """
   Whether the operator names any other server at all — the intranet question,
@@ -105,9 +108,23 @@ defmodule Vutuv.Tags.SourceServers do
   """
   def configured?, do: configured() != []
 
-  defp offered(blocked) do
+  @doc """
+  The servers trusted to relay **other** servers' posts: every one the operator
+  names, normalized, as a set for `Vutuv.Tags.ExternalPost.speaks_for_author?/2`
+  (issue #2174).
+
+  Listing a server means trusting it with that, which is the difference from a
+  server a member types in: such a server speaks for its own members only.
+  Neither the feature switch nor the blocklist is asked here — a switched-off
+  installation fetches and draws nothing anyway, and a blocked server is
+  refused before it is asked and purged of what it filed.
+  """
+  def relays, do: MapSet.new(configured())
+
+  # `listed` is `configured/0`, read once by the caller, which needs it too.
+  defp offered(listed, blocked) do
     if enabled?() do
-      configured() |> Enum.reject(&MapSet.member?(blocked, &1)) |> Enum.uniq()
+      listed |> Enum.reject(&MapSet.member?(blocked, &1)) |> Enum.uniq()
     else
       []
     end
@@ -132,27 +149,31 @@ defmodule Vutuv.Tags.SourceServers do
   The rows the panel draws for one follow: this installation first, then the
   servers this follow already names, then the ones on offer it does not.
 
-  Each row is `%{host:, local?:, picked?:, blocked?:, info:}`, with `info` the
-  stored `%SourceServer{}` or `nil` for a server nobody has asked yet. A server
-  the operator blocked after somebody picked it is still shown — it is on their
-  follow, and hiding it would leave them a source they cannot see to remove.
+  Each row is `%{host:, local?:, picked?:, own?:, blocked?:, info:}`, with
+  `info` the stored `%SourceServer{}` or `nil` for a server nobody has asked
+  yet, and `own?` marking a picked server the operator does not list — one the
+  member typed in (issue #2166). A server the operator blocked after somebody
+  picked it is still shown — it is on their follow, and hiding it would leave
+  them a source they cannot see to remove.
   """
   def rows(sources) when is_list(sources) do
     local = Tags.local_tag_follow_source()
     picked = Enum.reject(sources, &(&1 == local))
+    listed = configured()
 
     # One blocklist query for both jobs: dropping a blocked server from the
     # offers, and marking a blocked one the member already picked.
-    blocked = blocked_hosts(Enum.uniq(picked ++ configured()))
-    hosts = Enum.uniq(picked ++ offered(blocked))
+    blocked = blocked_hosts(Enum.uniq(picked ++ listed))
+    hosts = Enum.uniq(picked ++ offered(listed, blocked))
     infos = infos(hosts)
 
-    [%{host: local, local?: true, picked?: true, blocked?: false, info: nil}] ++
+    [%{host: local, local?: true, picked?: true, own?: false, blocked?: false, info: nil}] ++
       Enum.map(hosts, fn host ->
         %{
           host: host,
           local?: false,
           picked?: host in picked,
+          own?: host not in listed,
           blocked?: MapSet.member?(blocked, host),
           info: Map.get(infos, host)
         }
@@ -251,16 +272,19 @@ defmodule Vutuv.Tags.SourceServers do
   # The literal half of the guard, asked before any request: a value that was
   # never a hostname must not cost a stranger's server a probe, and must not be
   # answered "did not answer".
+  # A value that is no server name is quoted as it was typed: there is no
+  # stored spelling to show for something that will never be stored.
   defp server_name(typed) do
     case TagFollowSource.normalize_source(typed) do
       nil ->
         {:error, {:not_a_server, to_string(typed)}}
 
       host ->
-        cond do
-          host == Tags.local_tag_follow_source() -> {:error, :local}
-          reason = TagFollowSource.refusal(host) -> {:error, {reason, host}}
-          true -> {:ok, host}
+        case host != Tags.local_tag_follow_source() && TagFollowSource.refusal(host) do
+          false -> {:error, :local}
+          nil -> {:ok, host}
+          :not_a_server -> {:error, {:not_a_server, to_string(typed)}}
+          reason -> {:error, {reason, host}}
         end
     end
   end

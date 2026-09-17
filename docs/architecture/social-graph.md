@@ -352,6 +352,36 @@ walked around by writing `www.www.<host>`, which
 `Vutuv.Tags.TagFollowSource.normalize_source/1` would then store and poll as
 `www.<host>`.
 
+**Who may speak for an author** (issues #2174 and #2199) sits under both of
+those. A row is kept only when the server that filed it may
+(`Vutuv.Tags.ExternalPost.speaks_for_author?/2`): the home copy, or a row from a
+server in `TAG_SOURCE_SERVERS`, which the operator vetted and which, if honest,
+checks the signatures of what it relays. A server a member typed in speaks for
+its own members only. Anything else it hands over is one stranger's unverified
+word about another server's member, byte for byte a card it could have
+invented. Kept, it put words under a real person's name, and folded in with the
+honest copies it raised the server count and could be the copy a card was drawn
+from. The profile link under the name is part of that claim, so such a server's
+own member counts only when the link is empty or on its own host. Hosts are
+only read from an address a browser reads the same way
+(`Vutuv.ChangesetHelpers.web_url?/1`, which refuses a backslash, whitespace, a
+control character, a login before the host and anything `URI.new/1` refuses):
+`URI.parse/1` finds `evil.example` in
+`https://victim.example\@evil.example/../@alice`, a browser opens
+`victim.example`. A relay's row needs such addresses too, since the card hands
+both to a browser.
+`Vutuv.Tags.ExternalTagClient` refuses such a status on the way in. Trust is
+then kept at rest rather than asked on every read:
+`ExternalPosts.drop_unbacked/0` deletes such rows on every fetcher tick beside
+`drop_written_here/0`, and once at boot, because the relay list only changes
+with a restart. That covers rows filed before the rule, rows the previous
+release files during a deploy, and rows of a server the operator has since
+taken off the list. SQL narrows to every unlisted server's rows plus any row
+whose address is not plainly one, and the predicate decides. A reported row
+stays as the tombstone it is, and a report on an unbacked row by id answers
+`:not_found`, so the ledger never names a server a stranger picked. The panel
+says so under the address field.
+
 The **Mastodon API drops these rows** rather than rendering them
 (`Vutuv.MastodonApi.Presenter.statuses/2`): every field of a `Status` that
 matters hangs off an `Account` object, and inventing an id for an author we hold
@@ -364,8 +394,14 @@ those public timelines itself.
 Every tag chip in the feed's "Tags you follow" card carries a small number: how
 many servers feed that tag, **this installation included**, so a plain follow
 reads `1` rather than `0`. Pressing it opens the panel that changes them, inside
-the card (`tag_sources_panel/1` in `VutuvWeb.PostLive.Feed`) — the rail is
-`hidden md:block`, so this is a desktop surface for now.
+the card. The rail is `hidden md:block`, so the same chip also stands beside the
+follow button on a tag page (issue #2157), on every screen size, whenever the
+signed-in member follows that tag themselves and the installation reads other
+servers. `Vutuv.Tags.followed_tag_source_count/2` answers "followed, and from
+how many servers" in one query: the controller reads it for the follow pill and
+the chip alike, and the socket asks again. `VutuvWeb.TagLive.Sources.chip_count/1`
+drops the chip where the installation reads no other server. That is the
+phone's way in.
 
 The panel offers the servers in **`TAG_SOURCE_SERVERS`**, ten by default, each
 with its own description and size beside it: accounts, accounts active this
@@ -425,11 +461,38 @@ switched on; its OAuth path is a feature of its own.
 
 The panel draws from what is stored and fills in behind itself (`start_async`),
 because asking ten servers is dozens of requests and seconds of wall clock, and
-a member who pressed a chip is owed the panel now. The markup is
-`VutuvWeb.PostLive.TagSources`, a sibling of the feed's other pieces rather than
-another 350 lines inside it — the tag page and an organization's Following list
-both show followed tags with no way to say where they come from, and each is a
-caller this panel is one refactor away from.
+a member who pressed a chip is owed the panel now.
+
+**One panel, two hosts.** `VutuvWeb.PostLive.TagSources` is a LiveComponent that
+owns everything behind the chip: which tag is open, its rows, the last refusal,
+the switches, the typed field and that refresh. The feed and the tag page's
+small embedded LiveView (`VutuvWeb.TagLive.Sources`) each render it once and
+draw the chips themselves; a chip reaches the panel with
+`phx-target="#tag-sources"`, and the panel tells its host by message which chip
+is open and what a changed chip now counts, read off the rows it has just
+drawn, so no host queries again. The tag page's dead render draws the chip from
+the tag's public fields in its session and reads nothing; its socket resolves
+the member from the session token, and mounts the panel only for a member it
+vouched for.
+The chip is the viewer's private control, so the tag page's agent formats do
+not carry it. An organization's Following list still shows followed tags with
+no way to say where they come from; it is a third host away from that.
+
+**The panel answers where the member is looking** (issue #2166). The chip is a
+bordered pill with a globe and a `title`, sized to the tag chip's line in the
+rail and given a 40px target on the tag page (`source_chip/1`'s `size`). A
+server the member typed in (`own?` in `SourceServers.rows/1`: picked, and not
+on the operator's list) is listed directly above the field rather than among
+the offers, and "host now feeds #tag" appears under the field in a live region
+that is always rendered. An add empties the field by rendering it under a new
+id (`field_key`), because LiveView never patches the value of a focused input;
+a refusal renders the typed text back (`typed`), because it does patch an
+unfocused one. At the cap the sentence saying so stands above the
+switches, and every switch it holds back is dimmed and names it in
+`aria-describedby`; a switch that is on stays usable, since switching it off
+frees the slot. German calls the feature "das Tag", so a sentence about it
+names the tag with its hash (`error_text/2` takes the tag) instead of a
+compound like "Tag-Zeitleiste", which reads as a *day*.
 
 ### Finding a tag that is suddenly busy (issue #2129)
 
@@ -467,15 +530,58 @@ now stands and one muted line says what and why. What decides whether the row
 exists at all is `Vutuv.Tags.Trending.asking?/0` — the flag plus a non-empty
 `TAG_SOURCE_SERVERS` — because "nothing stood out today" is only honest where
 somebody was asked, and an intranet installation reading no other server gets no
-row rather than a nightly report about servers it never touches.
+row rather than a nightly report about servers it never touches. The offer also
+leaves out what the reader already follows, so a reader following every busy tag
+reaches an empty row on a busy day; `Vutuv.Tags.Trending.offer/1` says whether
+that subtraction is what emptied it (`all_followed?`, read off the rows the one
+query already returned), and the row then says they already follow everything
+busy elsewhere instead of calling the day quiet (issue #2209).
 
 **The loudest tag is often a machine, and the spread does not catch it.**
 `#mow4` trended on seven of the nine servers that answered — a bot farm that
 federates widely trends everywhere. What catches it is one sample of the tag's
-own timeline from its busiest server, where both facts are the remote server's
-own: 40 of 40 statuses came from a single domain and 39 of them were flagged as
-bot accounts, against 13 to 26 distinct domains and at most 10 of 40 bots for
-every ordinary tag. A tag that cannot be sampled at all is **not** offered.
+own timeline from a server that listed it, where both facts are the remote
+server's own: 40 of 40 statuses came from a single domain and 39 of them were
+flagged as bot accounts, against 13 to 26 distinct domains and at most 10 of 40
+bots for every ordinary tag. A tag that cannot be sampled at all is **not**
+offered.
+
+**A blocked instance does not vote** (issue #2204). `ExternalTagClient.authors/2`
+drops every status whose author lives on a server in the operator's blocklist
+before the sample is counted, the same check the pull makes per post. Counted,
+such a server was one more author domain towards `min_author_hosts`, and its
+bots moved the bot share in either direction. On 17 September 2026 the seven
+live samples flipped no verdict, since no author in them lived on a blocked
+server. Blocking each sample's busiest foreign server by hand flipped none
+either, though it moved `#FollowFriday` from 50 % bots to 9 %. Only a blocked
+server placed where it decides the verdict flips it, in both directions.
+
+**The sample is spread over the servers that listed the tag** (issue #2160).
+It used to come from each candidate's busiest server, which put seven of one
+real pass's eighteen requests on mastodon.social within five seconds. Now each
+candidate is sampled on whichever of its reporters has been asked least this
+pass (ties go to the busiest), and no server is asked more than
+`census_per_host` times. A candidate whose reporters have all had their share
+is held back and logged.
+
+**The census works through every candidate** (`Vutuv.Tags.TrendVerdict`,
+table `tag_trend_verdicts`). Walking loudest first on every pass, the cap
+sampled the same few candidates for good: two on an installation reading one
+server, and an empty row when those two were bot waves. So each candidate's
+last verdict is kept with the time it was taken, stamped on every outcome, a
+failed census included. A pass samples the never-sampled first, then the
+oldest verdicts (ties stay loudest first), and offers every candidate whose
+current verdict passed: this pass's, or a stored one younger than four
+intervals, the same horizon after which an offer stops counting as "right
+now". A stale verdict is deleted once its tag stops trending. The verdicts are
+a table of their own because the release serving traffic during a deploy reads
+every `tag_trends` row as an offer.
+On 17 September 2026 the nine shipped servers that answered listed seven
+candidates, each on five to eight of them: the old rule put three samples each
+on mastodon.online and hachyderm.io, the new one asks seven servers once each.
+Every threshold in `Vutuv.Tags.Trending.settings/0` is a `TAG_TRENDING_*`
+variable (`docs/ADMINS.md`), because an installation reading one server can
+never meet "listed by two" and needs `min_servers` at 1.
 
 **A spike shortens the pull at once.** The cadence above is a measurement, so it
 only learns about a news event after the event has already filled a fetch or

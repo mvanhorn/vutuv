@@ -2832,7 +2832,7 @@ defmodule Vutuv.Fediverse do
   end
 
   defp deliverable_undo?(%Follow{remote_account: %RemoteAccount{} = account}, blocked) do
-    not MapSet.member?(blocked, BlockedInstance.normalize_host(account.actor_uri))
+    not covered_by_block?(BlockedInstance.normalize_host(account.actor_uri), blocked)
   end
 
   defp deliverable_undo?(_follow, _blocked), do: false
@@ -5692,11 +5692,19 @@ defmodule Vutuv.Fediverse do
   the remote actor is fetched, so a blocked server costs us neither an outbound
   request nor a write. A `nil`/unparseable host is not blocked — the request
   fails the signature check moments later anyway.
+
+  **A block on a host covers its `www.` alias too** (issue #2174). The host
+  asked about is written by whoever sent the document — an actor id, a status's
+  `acct` — so compared unfolded, `bob@www.shouty.example` walked past a block on
+  `shouty.example`. Folding is safe here for the reason `same_site?/2` gives:
+  this answer is only ever read as "drop it". It runs **one way**: a block on
+  `www.X` covers `www.X` and `www.www.X`, never the bare `X`, which a different
+  operator may hold.
   """
   def instance_blocked?(uri) do
     case BlockedInstance.normalize_host(uri) do
       nil -> false
-      host -> Repo.exists?(from(b in BlockedInstance, where: b.host == ^host))
+      host -> Repo.exists?(from(b in BlockedInstance, where: b.host in ^block_names(host)))
     end
   end
 
@@ -5709,14 +5717,35 @@ defmodule Vutuv.Fediverse do
   Each value goes through `BlockedInstance.normalize_host/1` first, so an actor
   id, a `@user@host` handle and a bare hostname all answer alike; the returned
   set holds the normalized spellings, which is what a caller must compare
-  against.
+  against — the spelling asked about, not the entry that covers it, since the
+  `www.` fold above applies here too.
   """
   def blocked_hosts(hosts) when is_list(hosts) do
-    normalized = hosts |> Enum.map(&BlockedInstance.normalize_host/1) |> Enum.reject(&is_nil/1)
+    normalized =
+      hosts
+      |> Enum.map(&BlockedInstance.normalize_host/1)
+      |> Enum.reject(&is_nil/1)
+      |> Enum.uniq()
 
-    Repo.all(from(b in BlockedInstance, where: b.host in ^normalized, select: b.host))
-    |> MapSet.new()
+    names = Enum.flat_map(normalized, &block_names/1)
+
+    blocked =
+      Repo.all(from(b in BlockedInstance, where: b.host in ^names, select: b.host))
+      |> MapSet.new()
+
+    normalized |> Enum.filter(&covered_by_block?(&1, blocked)) |> MapSet.new()
   end
+
+  # The blocklist entries that cover `host`: itself, then what is left as each
+  # leading `www.` comes off — `www.www.x`, `www.x`, `x`. Never the other way
+  # round, which is what keeps a block on an alias off the apex. The one
+  # spelling of the fold, so the single check, the batched one, the undo sweep
+  # and the purge cannot disagree about which host a block reaches.
+  defp block_names("www." <> rest = host), do: [host | block_names(rest)]
+  defp block_names(host), do: [host]
+
+  defp covered_by_block?(host, blocked),
+    do: Enum.any?(block_names(host), &MapSet.member?(blocked, &1))
 
   @doc """
   Blocks a remote server and purges everything already stored from it.
@@ -5752,8 +5781,9 @@ defmodule Vutuv.Fediverse do
   end
 
   @doc """
-  Deletes everything stored from `host`: its remote followers, the accounts its
-  members hold that anybody here follows (and, through the cascade, those
+  Deletes everything stored from `host` and from its `www.` alias, which a
+  block covers too (`instance_blocked?/1`): its remote followers, the accounts
+  its members hold that anybody here follows (and, through the cascade, those
   follows), the replies its members wrote under vutuv posts, what a followed
   tag pulled from it or from its members elsewhere (issue #2127), the outbound
   deliveries still queued for it and the records of what was delivered there.
@@ -5761,18 +5791,20 @@ defmodule Vutuv.Fediverse do
   external_posts: n, notes: n, deliveries: n, post_deliveries: n}`.
   """
   def purge_instance(host) when is_binary(host) do
+    hosts = covered_hosts(host)
+
     # Whose follower tables are about to lose rows, asked while they still exist.
     followed_members =
       Repo.all(
         from(f in Follower,
-          where: uri_host(f.actor_uri) == ^host,
+          where: uri_host(f.actor_uri) in ^hosts,
           distinct: true,
           select: f.user_id
         )
       )
 
     {followers, _} =
-      Repo.delete_all(from(f in Follower, where: uri_host(f.actor_uri) == ^host))
+      Repo.delete_all(from(f in Follower, where: uri_host(f.actor_uri) in ^hosts))
 
     broadcast_remote_followers_changed(followed_members)
 
@@ -5786,7 +5818,7 @@ defmodule Vutuv.Fediverse do
       from(p in RemotePost,
         join: a in RemoteAccount,
         on: a.id == p.remote_account_id,
-        where: a.host == ^host
+        where: a.host in ^hosts
       )
 
     # Their pictures' files, and the avatars, before the rows cascade away
@@ -5794,7 +5826,7 @@ defmodule Vutuv.Fediverse do
     # The wipe hands back the post ids it read, which is also the tally.
     cached_posts = length(wipe_media(host_posts))
 
-    wipe_avatars(from(a in RemoteAccount, where: a.host == ^host))
+    wipe_avatars(from(a in RemoteAccount, where: a.host in ^hosts))
 
     # Which members are about to lose follows, asked while the rows still
     # exist. Named for the members it holds, not `followers` — that is already
@@ -5802,26 +5834,26 @@ defmodule Vutuv.Fediverse do
     # returned tally would silently become a list of member ids.
     follow_owners =
       remote_follow_user_ids(
-        from(a in RemoteAccount, where: a.host == ^host, select: %{id: a.id})
+        from(a in RemoteAccount, where: a.host in ^hosts, select: %{id: a.id})
       )
 
     {remote_accounts, _} =
-      Repo.delete_all(from(a in RemoteAccount, where: a.host == ^host))
+      Repo.delete_all(from(a in RemoteAccount, where: a.host in ^hosts))
 
     broadcast_remote_follows_changed(follow_owners)
 
     # A block is also a takedown: text that server's members wrote under our
     # members' posts goes with it (issue #1069), not just the follow rows.
     {notes, _} =
-      Repo.delete_all(from(n in Note, where: uri_host(n.actor_uri) == ^host))
+      Repo.delete_all(from(n in Note, where: uri_host(n.actor_uri) in ^hosts))
 
     {deliveries, _} =
-      Repo.delete_all(from(d in Delivery, where: uri_host(d.inbox_uri) == ^host))
+      Repo.delete_all(from(d in Delivery, where: uri_host(d.inbox_uri) in ^hosts))
 
     # A blocked server is not talked to again, so the record of what it received
     # (issue #1102) would only ever address a revocation nobody will deliver.
     {post_deliveries, _} =
-      Repo.delete_all(from(d in PostDelivery, where: uri_host(d.inbox_uri) == ^host))
+      Repo.delete_all(from(d in PostDelivery, where: uri_host(d.inbox_uri) in ^hosts))
 
     # What a followed tag pulled off that server, and what it pulled off other
     # servers that this one's members had written (issue #2127). Deleted rather
@@ -5829,7 +5861,9 @@ defmodule Vutuv.Fediverse do
     # itself at rest" is this function's whole promise, and the filter is what
     # covers the rows a *later* block finds — not a reason to keep them.
     {external_posts, _} =
-      Repo.delete_all(from(p in ExternalPost, where: p.source == ^host or p.author_host == ^host))
+      Repo.delete_all(
+        from(p in ExternalPost, where: p.source in ^hosts or p.author_host in ^hosts)
+      )
 
     %{
       followers: followers,
@@ -5840,6 +5874,22 @@ defmodule Vutuv.Fediverse do
       deliveries: deliveries,
       post_deliveries: post_deliveries
     }
+  end
+
+  # Every spelling a block on `host` covers (issue #2174): the host and each
+  # `www.` alias of it, which is `block_names/1` run backwards, so the purge
+  # cannot fold differently from the gates that keep new rows out: `www.x` goes
+  # with a block on `x`, `other.x` and `wwwx` stay. Spelled out rather than read
+  # from the tables, so each delete matches exactly these and nothing is scanned
+  # first. The aliases stop at the longest hostname there is; a longer one is no
+  # server anything here could have fetched from or been signed by.
+  defp covered_hosts(host) do
+    aliases =
+      ("www." <> host)
+      |> Stream.iterate(&("www." <> &1))
+      |> Enum.take_while(&(byte_size(&1) <= BlockedInstance.max_host()))
+
+    [host | aliases]
   end
 
   @doc """

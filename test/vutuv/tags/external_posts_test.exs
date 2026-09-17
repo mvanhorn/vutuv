@@ -22,8 +22,10 @@ defmodule Vutuv.Tags.ExternalPostsTest do
   alias Vutuv.Tags.ExternalPost
   alias Vutuv.Tags.ExternalPosts
   alias Vutuv.Tags.Merge
+  alias Vutuv.Tags.SourceServers
   alias Vutuv.Tags.Tag
   alias Vutuv.Tags.TagFollow
+  alias Vutuv.Tags.Timeline
 
   @source "mastodon.example"
   @other_source "troet.example"
@@ -72,7 +74,7 @@ defmodule Vutuv.Tags.ExternalPostsTest do
   # scope anyway and only looks scoped.
   defp key(url, host \\ @source), do: ExternalPost.origin_key(%{url: url, author_host: host})
 
-  defp row(attrs), do: Enum.into(attrs, %{source: @source, author_host: @source})
+  defp row(attrs), do: Enum.into(attrs, %{source: @source, author_host: @source, author_url: nil})
 
   describe "due_sources/1" do
     test "answers a wanted pair that has never been fetched" do
@@ -480,7 +482,12 @@ defmodule Vutuv.Tags.ExternalPostsTest do
   # of production: the one post somebody really did report stood as **six** rows
   # of which two were marked (issue #2164).
   describe "a report" do
+    # Every relay below is filed by a server the operator listed: a server a
+    # member typed in is not drawn when it relays (issue #2174), so its rows
+    # cannot be reported either, and what is left to pin here is how far a
+    # listed relay's report reaches.
     setup do
+      put_config(:tag_source_servers, [@other_source, "impostor.example", "hachyderm.example"])
       {:ok, reporter: insert(:activated_user)}
     end
 
@@ -519,11 +526,13 @@ defmodule Vutuv.Tags.ExternalPostsTest do
     end
 
     # The same attack through the `www.` door (found on PR #2176). A member may
-    # not add `www.<host>` — `normalize_source/1` folds it away — but it folds
-    # **once**, so `www.www.victim` is stored and polled as `www.victim`. A card
-    # served from there claiming the victim's permalink and author host must not
-    # be the victim's own server, whatever the fold says elsewhere.
-    test "a mirror at the author's www. alias takes only itself down", %{reporter: reporter} do
+    # not add `www.<host>` — `normalize_source/1` folds it away — but it folded
+    # **once**, so `www.www.victim` was stored and polled as `www.victim`. A card
+    # served from there claiming the victim's permalink and author host is not
+    # the victim's own server, whatever the fold says elsewhere — and since
+    # #2174 it is not a listed relay either, so it is not drawn and a report on
+    # it by id reaches nothing at all.
+    test "a mirror at the author's www. alias takes nothing down", %{reporter: reporter} do
       tag = followed_tag()
       url = original("4760")
 
@@ -532,8 +541,8 @@ defmodule Vutuv.Tags.ExternalPostsTest do
 
       mirror = copy(tag, url, "www.#{@source}")
 
-      assert {:ok, :this_copy} = ExternalPosts.report(mirror.id, reporter)
-      assert Repo.get!(ExternalPost, mirror.id).reported_at
+      assert {:error, :not_found} = ExternalPosts.report(mirror.id, reporter)
+      refute Repo.get!(ExternalPost, mirror.id).reported_at
 
       for id <- [home.id, relayed.id] do
         row = Repo.get!(ExternalPost, id)
@@ -749,7 +758,14 @@ defmodule Vutuv.Tags.ExternalPostsTest do
     # of its own the report blanked nothing at all and still answered `:ok`.
     test "a row from before the author host was stored takes itself down", %{reporter: reporter} do
       tag = followed_tag()
-      post = external_post(tag, url: original("4730"), source: @source, author_host: nil)
+      # The helper would spell the link on the missing host, `https:///@ada`.
+      post =
+        external_post(tag,
+          url: original("4730"),
+          source: @other_source,
+          author_host: nil,
+          author_url: nil
+        )
 
       assert {:ok, :this_copy} = ExternalPosts.report(post.id, reporter)
 
@@ -923,10 +939,249 @@ defmodule Vutuv.Tags.ExternalPostsTest do
              )
     end
 
+    # A browser reads the backslash as a slash, so the first two open
+    # `https://victim.example/@alice/…` while `URI.parse/1` reads `evil.example`
+    # (a login, then the host). A login in front of the host is refused as well,
+    # whichever host it dresses up.
+    test "an address a browser reads differently from us is nobody's own copy" do
+      evil = %{source: "evil.example", author_host: "evil.example", author_url: nil}
+
+      for url <- [
+            "https://victim.example\\@evil.example/../@alice/1123",
+            "https://victim.example%5C@evil.example/../@alice/1123",
+            "https://user@evil.example/@alice/1123"
+          ] do
+        refute ExternalPost.home_copy?(Map.put(evil, :url, url)), url
+      end
+
+      refute ExternalPost.home_copy?(row(url: "https://user@#{@source}/@ada/1", author_url: nil))
+    end
+
     test "fails closed on a row with no author host and on an unusable address" do
       refute ExternalPost.home_copy?(row(url: "https://#{@source}/@ada/1", author_host: nil))
       refute ExternalPost.home_copy?(row(url: "not an address"))
       refute ExternalPost.home_copy?(%{})
+    end
+  end
+
+  # Issues #2174 and #2199: a server a member typed in speaks for its own
+  # members only. Its word about anybody else's is byte-identical to a forged
+  # card, so such a row is not drawn, not folded into an honest copy and not
+  # counted as one more server that carried the post.
+  describe "who may speak for an author" do
+    setup do
+      put_config(:tag_source_servers, [@other_source])
+      :ok
+    end
+
+    test "the post's own server, and a server the operator listed" do
+      relays = SourceServers.relays()
+      url = original("1")
+
+      assert ExternalPost.speaks_for_author?(row(url: url), relays)
+      assert ExternalPost.speaks_for_author?(row(url: url, source: @other_source), relays)
+      # A row fetched from the listed server's alias was not fetched from it.
+      refute ExternalPost.speaks_for_author?(
+               row(url: url, source: "www.#{@other_source}"),
+               relays
+             )
+
+      refute ExternalPost.speaks_for_author?(row(url: url, source: "hand.example"), relays)
+      refute ExternalPost.speaks_for_author?(%{}, relays)
+    end
+
+    # The link under the name is part of the claim a card makes. A projection
+    # that leaves the column out is not a row whose link was checked.
+    test "a server's own member, linked to a profile on another host" do
+      relays = SourceServers.relays()
+      own = row(url: original("1"), author_url: "https://#{@source}/@ada")
+      elsewhere = %{own | author_url: "https://victim.example/@ada"}
+
+      assert ExternalPost.speaks_for_author?(own, relays)
+      refute ExternalPost.speaks_for_author?(elsewhere, relays)
+      assert ExternalPost.speaks_for_author?(%{elsewhere | source: @other_source}, relays)
+      refute ExternalPost.speaks_for_author?(Map.delete(own, :author_url), relays)
+    end
+
+    # The review's case: a hand-typed server files its own "member" at an
+    # address and a profile a browser opens on the victim's server.
+    test "a link a browser reads as another host speaks for nobody" do
+      relays = SourceServers.relays()
+
+      forged = %{
+        source: "evil.example",
+        author_host: "evil.example",
+        url: "https://victim.example\\@evil.example/../@alice/1123",
+        author_url: "https://victim.example\\@evil.example/../@alice"
+      }
+
+      refute ExternalPost.speaks_for_author?(forged, relays)
+      refute ExternalPost.speaks_for_author?(%{forged | url: "https://evil.example/@a/1"}, relays)
+
+      for link <- [
+            "https://victim.example%5C@evil.example/@alice",
+            "https://user@evil.example/@alice"
+          ] do
+        refute ExternalPost.speaks_for_author?(
+                 %{forged | url: "https://evil.example/@a/1", author_url: link},
+                 relays
+               ),
+               link
+      end
+
+      # A listed relay may name any host, but not in a spelling the card would
+      # hand a browser to read its own way.
+      relayed = %{forged | source: @other_source, url: original("1")}
+      assert ExternalPost.speaks_for_author?(%{relayed | author_url: nil}, relays)
+      refute ExternalPost.speaks_for_author?(relayed, relays)
+      refute ExternalPost.speaks_for_author?(%{forged | source: @other_source}, relays)
+    end
+
+    # Production holds rows filed before the pull refused them. The sweep takes
+    # exactly those, and every surface then draws what is left.
+    test "the sweep takes exactly the rows nobody vouches for" do
+      tag = followed_tag("hand.example")
+      hand = [source: "hand.example", author_host: "hand.example"]
+
+      own = external_post(tag, [url: "https://hand.example/@bob/1"] ++ hand)
+      relayed = copy(tag, original("relayed"), @other_source)
+      # Not plainly an address, so the predicate rather than the prefilter answers.
+      queried = copy(tag, original("queried?lang=de"), @other_source)
+
+      # Unbacked too, but a tombstone: it draws nothing and keeps its report.
+      reported =
+        external_post(tag,
+          url: original("reported"),
+          source: "hand.example",
+          author_host: @source,
+          reported_at: DateTime.utc_now(:second)
+        )
+
+      unbacked = [
+        # Somebody else's member, told by a server a member typed in.
+        copy(tag, original("forged"), "hand.example"),
+        # Its own member, linked to somebody else's profile.
+        external_post(tag, [author_url: "https://victim.example/@ada"] ++ hand),
+        # An address a browser opens on another host (the review's case).
+        external_post(
+          tag,
+          [
+            url: "https://victim.example\\@hand.example/../@alice/1123",
+            author_url: "https://victim.example\\@hand.example/../@alice"
+          ] ++ hand
+        ),
+        # A listed relay, with a profile link a browser reads its own way.
+        external_post(tag,
+          url: original("login"),
+          source: @other_source,
+          author_host: @source,
+          author_url: "https://user@#{@source}/@ada"
+        )
+      ]
+
+      assert ExternalPosts.drop_unbacked() == length(unbacked)
+
+      assert ExternalPost |> select([p], p.id) |> Repo.all() |> Enum.sort() ==
+               Enum.sort([own.id, relayed.id, queried.id, reported.id])
+
+      assert ExternalPosts.drop_unbacked() == 0
+    end
+
+    test "a stored row linking its author elsewhere is drawn only from a listed server" do
+      tag = followed_tag("hand.example")
+
+      legacy =
+        external_post(tag,
+          url: "https://hand.example/@ada/1",
+          source: "hand.example",
+          author_host: "hand.example",
+          author_url: "https://victim.example/@ada"
+        )
+
+      # The setup's `put_config/2` puts the shipped list back afterwards.
+      Application.put_env(:vutuv, :tag_source_servers, ["hand.example"])
+      assert ExternalPosts.drop_unbacked() == 0
+
+      assert [%{post: %{id: id}}] = ExternalPosts.tag_finds(tag.id)
+      assert id == legacy.id
+      assert %{total: 1} = Timeline.page(tag, source: :fediverse)
+
+      Application.put_env(:vutuv, :tag_source_servers, [])
+      assert ExternalPosts.drop_unbacked() == 1
+
+      assert ExternalPosts.tag_finds(tag.id) == []
+      assert %{entries: [], total: 0} = Timeline.page(tag, source: :fediverse)
+    end
+
+    test "a planted copy does not fold in, does not count, and is never the one drawn" do
+      tag = followed_tag()
+      url = original("2199")
+
+      # Filed first, so arrival order alone would draw it.
+      planted =
+        external_post(tag,
+          url: url,
+          source: "hand.example",
+          author_host: @source,
+          author_acct: "ada@#{@source}"
+        )
+
+      relayed = copy(tag, url, @other_source)
+      assert ExternalPosts.drop_unbacked() == 1
+
+      assert [%{post: drawn, copies: copies}] = ExternalPosts.tag_finds(tag.id)
+      assert drawn.id == relayed.id
+      assert Enum.map(copies, & &1.id) == [relayed.id]
+      assert ExternalPosts.servers(%{external_post: drawn, copies: copies}) == [@other_source]
+
+      # A card redrawn after a report reads the rows again.
+      assert {%ExternalPost{id: redrawn}, [_only]} = ExternalPosts.refold([planted, relayed])
+      assert redrawn == relayed.id
+    end
+
+    test "a card nobody backs is drawn neither on the tag page nor in the feed" do
+      user = insert(:activated_user)
+      tag = insert(:tag)
+      {:ok, follow} = Tags.follow_tag(user, tag)
+      {:ok, _row} = Tags.add_tag_follow_source(follow, "hand.example")
+      {:ok, _row} = Tags.add_tag_follow_source(follow, @other_source)
+
+      _forged =
+        external_post(tag,
+          url: original("forged"),
+          source: "hand.example",
+          author_host: @source
+        )
+
+      own =
+        external_post(tag,
+          url: "https://hand.example/@bob/1",
+          source: "hand.example",
+          author_host: "hand.example"
+        )
+
+      relayed = copy(tag, original("honest"), @other_source)
+      shown = MapSet.new([own.id, relayed.id])
+      assert ExternalPosts.drop_unbacked() == 1
+
+      assert %{entries: entries, total: 2} = Timeline.page(tag, source: :fediverse)
+      assert MapSet.new(entries, & &1.external_post.id) == shown
+
+      assert MapSet.new(ExternalPosts.feed_items(user, 20, nil), & &1.external_post.id) == shown
+      assert length(ExternalPosts.feed_items(user, 20, nil, shape: :marks)) == 2
+    end
+
+    test "a server the operator takes off the list stops speaking for anybody else" do
+      tag = followed_tag()
+      relayed = copy(tag, original("later"), @other_source)
+
+      assert [%{post: %{id: id}}] = ExternalPosts.tag_finds(tag.id)
+      assert id == relayed.id
+
+      # The setup's `put_config/2` puts the shipped list back afterwards.
+      Application.put_env(:vutuv, :tag_source_servers, [])
+      assert ExternalPosts.drop_unbacked() == 1
+      assert ExternalPosts.tag_finds(tag.id) == []
     end
   end
 end

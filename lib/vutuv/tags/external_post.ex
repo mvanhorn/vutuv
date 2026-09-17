@@ -29,7 +29,7 @@ defmodule Vutuv.Tags.ExternalPost do
 
   use VutuvWeb, :model
 
-  import Vutuv.ChangesetHelpers, only: [scrub_nul: 1]
+  import Vutuv.ChangesetHelpers, only: [scrub_nul: 1, web_url?: 1]
 
   alias Vutuv.Fediverse
   alias Vutuv.Fediverse.BlockedInstance
@@ -263,13 +263,69 @@ defmodule Vutuv.Tags.ExternalPost do
   construction.
   """
   def home_copy?(%{source: source, url: url, author_host: host}) do
-    case authority_host(host) do
-      nil -> false
-      author -> authority_host(source) == author and authority_host(address_host(url)) == author
-    end
+    on_author_host?(url, host) and authority_host(source) == authority_host(host)
   end
 
   def home_copy?(_unusable), do: false
+
+  @doc """
+  Whether the server that filed this row may **speak for its author** — and so
+  whether the row may be kept, drawn, folded into a card or counted at all
+  (issues #2174 and #2199). `relays` is `Vutuv.Tags.SourceServers.relays/0`,
+  handed in so a caller asking of a whole list reads the configuration once.
+
+  Two rows pass. The **home copy** (`home_copy?/1`), which nothing in an answer
+  can forge because we chose and dialled that host ourselves — as long as the
+  profile link under the name (`:author_url`) is nil or on that same host, since
+  the link is part of the claim a card makes about who wrote it, and a server
+  must not hang a real person's profile under a name it made up. And a row filed
+  by a server the **operator** listed in `TAG_SOURCE_SERVERS`: an honest
+  Mastodon server checks the signatures on what it relays, and the operator
+  chose to trust these to do so, which also keeps an honest profile on another
+  host (a split-domain server, a bridge).
+
+  Everything else is a server a member typed in, talking about somebody else's
+  member: one stranger's unverified word, byte for byte the same as a card it
+  invented. Kept, it put words on this site under a real person's name and
+  address (#2174), and it folded into the honest copies of a post and decided
+  which one the card was drawn from (#2199). So a server a member names speaks
+  for its own members only.
+
+  The source is compared **exactly**. The column is written by
+  `Vutuv.Tags.TagFollowSource.normalize_source/1` and `relays` is spelled by
+  the same function, so the two already agree on case, trailing dot and `www.`;
+  folding the row's side again would only matter for a row from before #2176
+  that was fetched from `www.<host>`, and that alias is a subdomain somebody
+  other than the listed server may hold — the reason `home_copy?/1` does not
+  fold either.
+
+  Asked at the one way into the table (`Vutuv.Tags.ExternalTagClient`) and by
+  the sweep that keeps it true at rest (`Vutuv.Tags.ExternalPosts.drop_unbacked/0`),
+  because rows written before it existed are stored, and a server the operator
+  later takes off the list stops vouching for what it filed while it was on it.
+
+  **Neither address may read differently in a browser**
+  (`Vutuv.ChangesetHelpers.web_url?/1`), a listed relay's included: a relay may
+  name any host, but the card hands both addresses to a browser, and a spelling
+  that opens another host than the one we read says nothing anybody checked.
+
+  `row` needs `:source`, `:url`, `:author_host` and `:author_url`; a projection
+  without the link fails closed, which for the sweep means every row goes — its
+  test keeps a row that must survive for exactly that reason.
+  """
+  def speaks_for_author?(
+        %{source: source, url: url, author_url: link, author_host: host} = row,
+        relays
+      ) do
+    web_url?(url) and (is_nil(link) or web_url?(link)) and
+      (relay?(source, relays) or
+         (home_copy?(row) and (is_nil(link) or on_author_host?(link, host))))
+  end
+
+  def speaks_for_author?(_unusable, _relays), do: false
+
+  # Exact, for the reason the doc of `speaks_for_author?/2` gives.
+  defp relay?(source, relays), do: MapSet.member?(relays, source)
 
   @doc """
   Whether these words were written **here** — on this installation — and so are
@@ -311,8 +367,21 @@ defmodule Vutuv.Tags.ExternalPost do
   # wants one helper for both has to delete a name that says why there are two.
   defp authority_host(host), do: BlockedInstance.normalize_host(host)
 
-  defp address_host(url) when is_binary(url), do: URI.parse(url).host
-  defp address_host(_url), do: nil
+  # Fails closed on a host that will not normalise, so two missing hosts are
+  # never one.
+  defp on_author_host?(url, host) do
+    case authority_host(host) do
+      nil -> false
+      author -> authority_host(address_host(url)) == author
+    end
+  end
+
+  # Only from an address a browser reads the same way (`web_url?/1`): the
+  # lenient `URI.parse/1` finds `evil.example` in
+  # `https://victim.example\@evil.example/…`, where a browser opens the victim.
+  defp address_host(url) do
+    if web_url?(url), do: URI.parse(url).host
+  end
 
   defp normalize_origin(url) when is_binary(url),
     do: url |> URI.parse() |> unwrap_redirect() |> canonical_address()

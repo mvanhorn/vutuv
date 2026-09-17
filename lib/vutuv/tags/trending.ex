@@ -45,7 +45,7 @@ defmodule Vutuv.Tags.Trending do
   **The census counts strangers only** (issue #2196). Our own posts federate out
   with their hashtags, so the servers asked here hand them straight back, and
   counting them made this installation one more author server on the very gate
-  meant to catch a single source — `Vutuv.Tags.ExternalTagClient.author_entry/2`
+  meant to catch a single source — `stranger?/3` in `Vutuv.Tags.ExternalTagClient`
   carries the measurement and why they are dropped there rather than subtracted
   here. Both figures above are therefore about the world outside, as is the
   sample they are taken from. The tag's **volume** is not, and cannot be:
@@ -74,7 +74,9 @@ defmodule Vutuv.Tags.Trending do
   set instead of making the pass run on every tick of the two-minute loop.
 
   The offer is replaced wholesale by each pass, which is why nothing here has to
-  reconcile a name two passes disagree about.
+  reconcile a name two passes disagree about. What a pass cannot afford to ask
+  again is carried by the candidate's last verdict (`Vutuv.Tags.TrendVerdict`),
+  whose clock decides who is sampled next.
   """
 
   import Ecto.Query
@@ -92,9 +94,26 @@ defmodule Vutuv.Tags.Trending do
   alias Vutuv.Tags.Tag
   alias Vutuv.Tags.TrendCheck
   alias Vutuv.Tags.TrendingTag
+  alias Vutuv.Tags.TrendVerdict
+  alias Vutuv.UUIDv7
 
   @flag :fetch_trending_tags
 
+  # The one place these defaults live; `:tag_trending` in the application env
+  # holds only an installation's overrides (`config/runtime.exs`). Every number
+  # was calibrated against the ten shipped servers on 10 September 2026 (see the
+  # moduledoc):
+  #
+  #   offer            how many the card draws
+  #   min_uses         a floor, so a tag going from 0 to 3 is not "news"
+  #   spike_factor     today against the median of the six days before it
+  #   min_servers      how many servers must list it at all
+  #   min_author_hosts distinct author domains in the vetting sample
+  #   max_bot_percent  bot accounts in that sample, as their servers flag them
+  #   min_sample       below this the sample says nothing and the tag is dropped
+  #   vet_limit        how many sample requests one pass spends
+  #   census_per_host  how many of those one server may take (issue #2160)
+  #   interval_minutes between two passes
   @settings [
     offer: 5,
     min_uses: 25,
@@ -104,6 +123,7 @@ defmodule Vutuv.Tags.Trending do
     max_bot_percent: 50,
     min_sample: 10,
     vet_limit: 8,
+    census_per_host: 2,
     interval_minutes: 30
   ]
 
@@ -136,8 +156,13 @@ defmodule Vutuv.Tags.Trending do
   """
   def asking?, do: enabled?() and SourceServers.configured?()
 
-  @doc "The thresholds and the pace — see the moduledoc for where each number comes from."
-  def settings, do: Application.get_env(:vutuv, :tag_trending, @settings)
+  @doc """
+  The thresholds and the pace — see the moduledoc for where each number comes
+  from. Every one is an operator's knob (`config/runtime.exs`), and a key the
+  application env does not name keeps its default here rather than reading as
+  `nil`, which would compare as larger than any count and empty the offer.
+  """
+  def settings, do: Keyword.merge(@settings, Application.get_env(:vutuv, :tag_trending, []))
 
   @doc "How long between two passes."
   def interval_seconds, do: settings()[:interval_minutes] * 60
@@ -196,7 +221,7 @@ defmodule Vutuv.Tags.Trending do
     answers = for {host, :listed, entries} <- results, do: {host, entries}
     candidates = answers |> aggregate() |> judged(settings)
     hurried = hurry(candidates)
-    offered_count = candidates |> vetted(settings) |> replace_offer(now)
+    offered_count = candidates |> vetted(settings, now) |> replace_offer(now)
 
     tally(results, offered_count, hurried)
   end
@@ -260,16 +285,17 @@ defmodule Vutuv.Tags.Trending do
     Map.update(
       acc,
       key,
-      %{name: name, top: today, hosts: %{host => today}, history: history},
+      %{key: key, name: name, top: today, hosts: %{host => today}, history: history},
       fn seen ->
+        # `name` is the spelling of the server that sees the most of it. A tag's
+        # casing is its first writer's here (`Vutuv.Tags.Tag`), and out there it
+        # is whoever the crowd is — so the crowd decides.
         %{
-          # The spelling of the server that sees the most of it. A tag's casing
-          # is its first writer's here (`Vutuv.Tags.Tag`), and out there it is
-          # whoever the crowd is — so the crowd decides.
-          name: if(today > seen.top, do: name, else: seen.name),
-          top: max(today, seen.top),
-          hosts: Map.put(seen.hosts, host, today),
-          history: Enum.zip_with(seen.history, history, &+/2)
+          seen
+          | name: if(today > seen.top, do: name, else: seen.name),
+            top: max(today, seen.top),
+            hosts: Map.put(seen.hosts, host, today),
+            history: Enum.zip_with(seen.history, history, &+/2)
         }
       end
     )
@@ -289,6 +315,7 @@ defmodule Vutuv.Tags.Trending do
     [today | previous] = entry.history
 
     %{
+      key: entry.key,
       name: entry.name,
       uses: today,
       baseline: median(previous),
@@ -318,7 +345,7 @@ defmodule Vutuv.Tags.Trending do
 
   defp spiking?(row, settings) do
     row.uses >= settings[:min_uses] and row.servers >= settings[:min_servers] and
-      row.uses >= max(row.baseline, 1) * settings[:spike_factor] and mintable?(row.name)
+      row.uses >= max(row.baseline, 1) * settings[:spike_factor] and mintable?(row)
   end
 
   # A name that could not become a tag here must never be offered: the row's one
@@ -326,32 +353,100 @@ defmodule Vutuv.Tags.Trending do
   # `/tags/2026` or at a random hex string. `Vutuv.Tags.mintable_hashtag?/1` is
   # the same gate a `#hashtag` in a post body passes, so the row cannot mint
   # anything the composer would not. The length is the column's, and it is the
-  # only bound the trending list itself does not already impose.
-  defp mintable?(name) do
-    Tags.mintable_hashtag?(name) and byte_size(name) <= TrendingTag.max_name()
+  # only bound the trending list itself does not already impose; the folded key
+  # is bounded the same, since `tag_trend_verdicts` stores it and one name too
+  # long for that would fail the whole pass's upsert.
+  defp mintable?(%{name: name, key: key}) do
+    Tags.mintable_hashtag?(name) and byte_size(name) <= TrendingTag.max_name() and
+      byte_size(key) <= TrendingTag.max_name()
   end
 
   # --- The bot defence ------------------------------------------------------
 
-  # Walks the candidates loudest first, asking each one's busiest server who is
-  # posting it, and stops when the budget of requests is spent. Everything that
-  # survives is stored, not only what one reader will see: the reader takes what
-  # they do not already follow out, and a thinner list would leave them nothing.
-  defp vetted(candidates, settings) do
-    candidates
-    |> Enum.take(settings[:vet_limit])
-    |> Enum.map(&vet(&1, settings))
-    |> Enum.reject(&is_nil/1)
-  end
+  # Samples as many candidates as the budget allows and answers the ones whose
+  # current verdict passed, loudest first. Everything that passed is stored, not
+  # only what one reader will see: the reader takes what they do not already
+  # follow out, and a thinner list would leave them nothing.
+  #
+  # No server is asked more than `census_per_host` times in one pass (issue
+  # #2160): asking every candidate's busiest server put seven of one real pass's
+  # eighteen requests on mastodon.social within five seconds. With that cap,
+  # walking loudest first on every pass sampled the same few candidates for
+  # good — two, on an installation reading one server — and an empty row when
+  # those were bot waves. So the walk takes the never-sampled first and then the
+  # oldest verdict (`Vutuv.Tags.TrendVerdict`), stamps every outcome, and offers
+  # a candidate it did not reach on a verdict younger than four passes.
+  defp vetted(candidates, settings, now) do
+    fresh_after = DateTime.add(now, -max_age_seconds(settings))
+    keys = Enum.map(candidates, & &1.key)
 
-  defp vet(%{hosts: [host | _rest]} = row, settings) do
-    case ExternalPosts.guard("census #{host}", fn -> ExternalTagClient.authors(host, row.name) end) do
-      {:ok, {:ok, entries}} -> verdict(row, entries, settings)
-      _refused -> nil
+    known =
+      from(v in TrendVerdict, where: v.name in ^keys)
+      |> Repo.all()
+      |> Map.new(&{&1.name, &1})
+
+    asked = census(candidates, known, settings)
+    remember(asked, keys, now, fresh_after)
+
+    for row <- candidates,
+        %{outcome: "passed"} = verdict <- [current(row.key, asked, known, fresh_after)] do
+      Map.merge(row, Map.take(verdict, [:author_hosts, :bot_posts, :sampled]))
     end
   end
 
-  defp verdict(row, entries, settings) do
+  # One request per candidate at most, never-sampled first, then the oldest
+  # verdict; `Enum.sort_by/2` is stable, so ties stay loudest first.
+  defp census(candidates, known, settings) do
+    per_host = settings[:census_per_host]
+
+    {asked, _spent, _load, held_back} =
+      candidates
+      |> Enum.sort_by(&last_vetted(known[&1.key]))
+      |> Enum.reduce_while({%{}, 0, %{}, 0}, fn row, {asked, spent, load, held_back} ->
+        cond do
+          spent >= settings[:vet_limit] ->
+            {:halt, {asked, spent, load, held_back}}
+
+          host = census_host(row.hosts, load, per_host) ->
+            {:cont,
+             {Map.put(asked, row.key, vet(row, host, settings)), spent + 1,
+              Map.update(load, host, 1, &(&1 + 1)), held_back}}
+
+          true ->
+            {:cont, {asked, spent, load, held_back + 1}}
+        end
+      end)
+
+    if held_back > 0 do
+      Logger.info(
+        "Trending tags: #{held_back} candidate(s) held back by the per-server census cap"
+      )
+    end
+
+    asked
+  end
+
+  defp last_vetted(nil), do: {0, 0}
+  defp last_vetted(%TrendVerdict{vetted_at: at}), do: {1, DateTime.to_unix(at)}
+
+  # The reporter asked least so far this pass, which spreads the census across
+  # every server that listed the tag. A tie goes to the busiest of them —
+  # `hosts` is busiest first and `Enum.min_by/3` keeps the first of equals — as
+  # that one holds the most material to judge the tag on.
+  defp census_host(hosts, load, per_host) do
+    hosts
+    |> Enum.filter(&(Map.get(load, &1, 0) < per_host))
+    |> Enum.min_by(&Map.get(load, &1, 0), fn -> nil end)
+  end
+
+  defp vet(row, host, settings) do
+    case ExternalPosts.guard("census #{host}", fn -> ExternalTagClient.authors(host, row.name) end) do
+      {:ok, {:ok, entries}} -> verdict(entries, settings)
+      _refused -> %{outcome: "failed", author_hosts: nil, bot_posts: nil, sampled: nil}
+    end
+  end
+
+  defp verdict(entries, settings) do
     sampled = length(entries)
     hosts = entries |> Enum.map(& &1.host) |> Enum.uniq() |> length()
     bots = Enum.count(entries, & &1.bot?)
@@ -360,9 +455,55 @@ defmodule Vutuv.Tags.Trending do
       sampled >= settings[:min_sample] and hosts >= settings[:min_author_hosts] and
         bots * 100 <= sampled * settings[:max_bot_percent]
 
-    if passes?,
-      do: Map.merge(row, %{author_hosts: hosts, bot_posts: bots, sampled: sampled}),
-      else: nil
+    %{
+      outcome: if(passes?, do: "passed", else: "dropped"),
+      author_hosts: hosts,
+      bot_posts: bots,
+      sampled: sampled
+    }
+  end
+
+  # What this pass asked, else the stored verdict while it is young enough.
+  defp current(key, asked, known, fresh_after) do
+    case {Map.get(asked, key), Map.get(known, key)} do
+      {%{} = verdict, _stored} ->
+        verdict
+
+      {nil, %TrendVerdict{vetted_at: at} = stored} ->
+        if DateTime.after?(at, fresh_after), do: stored
+
+      {nil, nil} ->
+        nil
+    end
+  end
+
+  # Every outcome is stamped, a failed census included, in one upsert, and a
+  # stale verdict goes once its tag no longer trends, which keeps the table at
+  # a few passes' worth of candidates. Guarded like the clocks: losing the
+  # memory for one pass costs a repeated request, not the offer.
+  defp remember(asked, keys, now, fresh_after) do
+    rows =
+      Enum.map(asked, fn {key, verdict} ->
+        Map.merge(verdict, %{
+          id: UUIDv7.generate(),
+          name: key,
+          vetted_at: now,
+          inserted_at: DateTime.to_naive(now),
+          updated_at: DateTime.to_naive(now)
+        })
+      end)
+
+    ExternalPosts.guard("trend verdicts", fn ->
+      Repo.insert_all(TrendVerdict, rows,
+        on_conflict:
+          {:replace, [:outcome, :author_hosts, :bot_posts, :sampled, :vetted_at, :updated_at]},
+        conflict_target: [:name]
+      )
+
+      Repo.delete_all(
+        from(v in TrendVerdict, where: v.vetted_at <= ^fresh_after and v.name not in ^keys)
+      )
+    end)
   end
 
   # --- The offer ------------------------------------------------------------
@@ -395,29 +536,44 @@ defmodule Vutuv.Tags.Trending do
   end
 
   @doc """
-  What the card offers, loudest first.
+  What the card offers: `:tags`, loudest first, and `:all_followed?`, whether
+  something did run ahead and `:except` took every bit of it.
 
     * `:except` — names the reader already follows, matched the way a tag is
       matched here (case- and separator-insensitively through the slug), so a
       member following `#Warntag` is not offered `warntag`.
     * `:limit` — how many to draw; the configured `offer` by default.
 
-  Empty when the feature is off, and empty when the last pass is older than four
-  intervals — "right now" stops being true at some point, and a sweeper that
-  died must not leave three-day-old news on the card.
+  No tags when the feature is off, and none when the last pass is older than
+  four intervals — "right now" stops being true at some point, and a sweeper
+  that died must not leave three-day-old news on the card.
+
+  An empty offer says two different things to the reader: nothing is busy yet,
+  or everything that is busy is a tag they already follow. The row words
+  them differently (issue #2209). The unfiltered rows are in hand anyway, so the
+  answer costs no second query.
   """
-  def offers(opts \\ []) do
+  def offer(opts \\ []) do
     if enabled?() do
       settings = settings()
       cutoff = DateTime.add(DateTime.utc_now(:second), -max_age_seconds(settings))
       except = opts |> Keyword.get(:except, []) |> MapSet.new(&SlugHelpers.tagify/1)
 
-      from(t in TrendingTag, where: t.checked_at > ^cutoff, order_by: [desc: t.uses, asc: t.name])
-      |> Repo.all()
-      |> Enum.reject(&MapSet.member?(except, SlugHelpers.tagify(&1.name)))
-      |> Enum.take(Keyword.get(opts, :limit, settings[:offer]))
+      rows =
+        from(t in TrendingTag,
+          where: t.checked_at > ^cutoff,
+          order_by: [desc: t.uses, asc: t.name]
+        )
+        |> Repo.all()
+
+      tags =
+        rows
+        |> Enum.reject(&MapSet.member?(except, SlugHelpers.tagify(&1.name)))
+        |> Enum.take(Keyword.get(opts, :limit, settings[:offer]))
+
+      %{tags: tags, all_followed?: tags == [] and rows != []}
     else
-      []
+      %{tags: [], all_followed?: false}
     end
   end
 
