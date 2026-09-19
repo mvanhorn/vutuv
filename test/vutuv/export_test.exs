@@ -75,6 +75,67 @@ defmodule Vutuv.ExportTest do
     assert draft.image_count == 0
   end
 
+  test "the ads a member saw are in the export, with when and how often (schema v13)" do
+    user = insert(:activated_user)
+
+    ad =
+      insert(:ad,
+        day: ~D[2026-04-14],
+        title: "Acme sucht Leute",
+        body: "Elixir in Mainz.",
+        url: "https://acme.example/jobs"
+      )
+
+    insert(:ad_sighting,
+      user: user,
+      ad: ad,
+      first_seen_at: ~U[2026-09-10 08:02:00Z],
+      last_seen_at: ~U[2026-09-10 10:31:00Z],
+      times_seen: 3
+    )
+
+    data = Export.build(user)
+
+    assert data.schema_version >= 13
+
+    assert data.seen_ads == [
+             %{
+               day: ~D[2026-04-14],
+               title: "Acme sucht Leute",
+               body: "Elixir in Mainz.",
+               url: "https://acme.example/jobs",
+               first_seen_at: ~U[2026-09-10 08:02:00Z],
+               last_seen_at: ~U[2026-09-10 10:31:00Z],
+               times_seen: 3
+             }
+           ]
+  end
+
+  test "a member's ad bookings say where they stand (schema v13)" do
+    user = insert(:activated_user)
+
+    insert(:ad,
+      user: user,
+      day: ~D[2026-04-15],
+      approved_at: nil,
+      rejected_at: ~U[2026-04-10 09:00:00Z],
+      rejection_reason: "Zu laut.",
+      price_cents: 99_000
+    )
+
+    assert [booking] = Export.build(user).ad_bookings
+
+    assert %{
+             status: :rejected,
+             rejection_reason: "Zu laut.",
+             price_cents: 99_000,
+             day: ~D[2026-04-15]
+           } =
+             booking
+
+    refute Map.has_key?(booking, :approved)
+  end
+
   test "a member's account deletion takes their drafts with it" do
     user = insert(:activated_user)
     :ok = Vutuv.Posts.save_draft(user, nil, %{"body" => "half a thought"})

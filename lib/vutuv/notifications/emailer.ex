@@ -31,14 +31,18 @@ defmodule Vutuv.Notifications.Emailer do
 
   alias Vutuv.Accounts
   alias Vutuv.Accounts.User
+  alias Vutuv.Ads
+  alias Vutuv.DateRegions
   alias Vutuv.Identity
   alias Vutuv.Mailto
   alias Vutuv.Moderation
   alias Vutuv.Notifications.Bounces
   alias Vutuv.Operator
   alias Vutuv.Organizations.Organization
+  alias Vutuv.Prefs
   alias Vutuv.Reports.DailyReport
   alias Vutuv.SavedSearches
+  alias VutuvWeb.AgentDocs.AdsDoc
   alias VutuvWeb.EmailComponents
   alias VutuvWeb.EmailText
   alias VutuvWeb.Markdown
@@ -46,6 +50,7 @@ defmodule Vutuv.Notifications.Emailer do
   alias VutuvWeb.Plug.Locale
   alias VutuvWeb.ReportHTML
   alias VutuvWeb.SavedSearchToken
+  alias VutuvWeb.UI
   alias VutuvWeb.UserHelpers
 
   # The visible From ({name, address}) on every message. Per-installation:
@@ -141,6 +146,20 @@ defmodule Vutuv.Notifications.Emailer do
     end
 
     :ok
+  end
+
+  @doc """
+  Mails a member at their first address, off the request path: `build` gets
+  the member and the address and returns the message. A member without an
+  address gets nothing.
+  """
+  def deliver_to_member(%User{} = user, build) when is_function(build, 2) do
+    deliver_async(fn ->
+      case Accounts.first_email_value(user) do
+        nil -> :ok
+        address -> user |> build.(address) |> deliver()
+      end
+    end)
   end
 
   # gen_smtp's puny-encoding raises on whitespace in a recipient address (one
@@ -757,21 +776,114 @@ defmodule Vutuv.Notifications.Emailer do
   and template are fixed German rather than locale-selected.
   """
   def ad_booking_email(%Vutuv.Ads.Ad{} = ad, booker) do
+    operator_ad_email(ad, booker, "ad_booking", "vutuv Anzeigenbuchung:")
+  end
+
+  @doc """
+  The operator notice that a booker withdrew their ad before it was approved:
+  the invoice for it may already be on its way.
+  """
+  def ad_cancellation_email(%Vutuv.Ads.Ad{} = ad, booker) do
+    operator_ad_email(ad, booker, "ad_cancellation", "vutuv Stornierung der Anzeige:")
+  end
+
+  @doc """
+  The operator notice that a booker took an already approved ad off the site.
+  Its own message rather than the cancellation one, because the money question
+  is the opposite: nothing is credited, and the invoice stands.
+  """
+  def ad_withdrawal_email(%Vutuv.Ads.Ad{} = ad, booker) do
+    operator_ad_email(ad, booker, "ad_withdrawal", "vutuv Anzeige zurückgezogen:")
+  end
+
+  defp operator_ad_email(ad, booker, template_base, subject) do
+    # The invoice is written from this mail, so it names the purchase: the whole
+    # stretch of days and the price of the block, never one row's share.
+    purchase = Ads.purchase(ad)
+    # This notice is German whatever the installation's default locale is, and
+    # `ad_period/2` says "bis" through gettext - so pin the locale rather than
+    # inherit the sending Task's, which is how a German subject once said "to".
+    period = in_locale("de", fn -> ad_period(purchase, "DE") end)
+
     base_email()
     # Critical for the same reason a PIN is: a booking the member just paid for
-    # has to reach the operator or nobody writes the invoice, so it must not be
-    # dropped by the bounce suppression (see deliver/1).
+    # has to reach the operator or nobody writes (or credits) the invoice, so
+    # it must not be dropped by the bounce suppression (see deliver/1).
     |> put_class(:critical)
     |> to(operator_recipient())
-    |> subject("vutuv Anzeigenbuchung für den #{Calendar.strftime(ad.day, "%d.%m.%Y")}")
-    |> render_bodies("ad_booking", "de", %{
+    |> subject("#{subject} #{period}")
+    |> render_bodies(template_base, "de", %{
       ad: ad,
       booker: booker,
-      booker_email: Vutuv.Accounts.first_email_value(booker),
       billing_address: billing_address(ad),
-      price: format_euro_cents(ad.price_cents),
+      period: period,
+      days: purchase.days,
+      # Everything still waiting, this booking included: the mail that says one
+      # arrived is also the only place that says what else is outstanding.
+      pending: pending_lines(),
+      invoice: invoice_facts(ad, purchase, period, Ads.invoice_recipient(ad, booker)),
+      admin_url: "#{public_url()}admin/ads/#{ad.id}",
       url: public_url()
     })
+  end
+
+  # Everything the operator needs to write the invoice, in one map so the text
+  # and the HTML body print the same figures rather than each doing the
+  # arithmetic. The list price and the code that reduced it are both named: a
+  # discount is stamped beside the price rather than taken out of it, so a mail
+  # quoting `price_cents` alone would invoice the member for money the code had
+  # already taken off - and `net` is the only figure that is the amount due.
+  defp invoice_facts(ad, purchase, period, recipient) do
+    %{
+      period: period,
+      days: purchase.days,
+      booked_at: booked_at(ad),
+      recipient: recipient,
+      price: format_euro_cents(purchase.price_cents),
+      discount: discount_line(purchase, ad),
+      net: format_euro_cents(purchase.net_cents),
+      vat_percent: Ads.vat_percent(),
+      vat: format_euro_cents(Ads.vat_cents(purchase.net_cents)),
+      gross: format_euro_cents(Ads.gross_cents(purchase.net_cents))
+    }
+  end
+
+  # When the booking was made, in the wall-clock the ad system already runs on
+  # (`Ads.today/0` is the Berlin calendar day). The stored instant is UTC, and
+  # an order date on an invoice two hours off the one the member remembers is
+  # an argument nobody needs.
+  # nil for an ad that was never inserted, which is not only a test shape: the
+  # row is the thing that carries the moment, so a struct without one has no
+  # order date to state and the line is left out rather than guessed at.
+  defp booked_at(%{inserted_at: nil}), do: nil
+
+  defp booked_at(ad) do
+    ad.inserted_at
+    |> DateTime.from_naive!("Etc/UTC")
+    |> Vutuv.BerlinTime.naive()
+    |> Calendar.strftime("%d.%m.%Y, %H:%M Uhr")
+  end
+
+  # What a code took off, and which code it was - nil where none was used, so
+  # the ordinary booking shows no row about a discount it did not get.
+  defp discount_line(%{discount_cents: off}, _ad) when off in [0, nil], do: nil
+
+  defp discount_line(%{discount_cents: off}, ad),
+    do: %{amount: format_euro_cents(off), code: ad.discount_code_id}
+
+  # The review queue as the operator reads it, formatted here so both bodies
+  # only print it. The operator notices are fixed German, so the date pattern is
+  # too: nobody but this installation's operator ever receives them.
+  defp pending_lines do
+    in_locale("de", fn ->
+      Enum.map(Ads.pending_purchases(), fn purchase ->
+        %{
+          period: ad_period(purchase, "DE"),
+          title: purchase.ad.title,
+          username: purchase.ad.user && purchase.ad.user.username
+        }
+      end)
+    end)
   end
 
   # The invoice address block, optional lines (organization, VAT id) folded away.
@@ -789,7 +901,7 @@ defmodule Vutuv.Notifications.Emailer do
     )
   end
 
-  # 125000 -> "1.250,00" (fixed German formatting, like the recipient).
+  # 25000 -> "250,00" (fixed German formatting, like the recipient).
   defp format_euro_cents(cents) do
     euros =
       div(cents, 100)
@@ -801,6 +913,81 @@ defmodule Vutuv.Notifications.Emailer do
     decimals = rem(cents, 100) |> Integer.to_string() |> String.pad_leading(2, "0")
     "#{euros},#{decimals}"
   end
+
+  @doc "The booker's receipt: their ad is booked and waits for the review."
+  def ad_booked_email(user, email, %Vutuv.Ads.Ad{} = ad) do
+    booker_email(user, email, ad, "ad_booked", fn
+      day, 1 -> gettext("Your ad for %{day} is booked", day: day)
+      period, _days -> gettext("Your ad for %{period} is booked", period: period)
+    end)
+  end
+
+  @doc "The booker's ad passed the review and runs on its day."
+  def ad_approved_email(user, email, %Vutuv.Ads.Ad{} = ad) do
+    booker_email(user, email, ad, "ad_approved", fn
+      day, 1 -> gettext("Your ad for %{day} is approved", day: day)
+      period, _days -> gettext("Your ad for %{period} is approved", period: period)
+    end)
+  end
+
+  @doc "The booker's ad was turned down, with the admin's reason."
+  def ad_rejected_email(user, email, %Vutuv.Ads.Ad{} = ad) do
+    booker_email(user, email, ad, "ad_rejected", fn
+      day, 1 -> gettext("We cannot run your ad for %{day}", day: day)
+      period, _days -> gettext("We cannot run your ad for %{period}", period: period)
+    end)
+  end
+
+  @doc "An admin withdrew the booker's ad."
+  def ad_cancelled_email(user, email, %Vutuv.Ads.Ad{} = ad) do
+    booker_email(user, email, ad, "ad_cancelled", fn
+      day, 1 -> gettext("Your ad for %{day} is cancelled", day: day)
+      period, _days -> gettext("Your ad for %{period} is cancelled", period: period)
+    end)
+  end
+
+  # About the member's own booking, so transactional. What every line of it
+  # names is the PURCHASE, never the row: a week's rows each carry one day and
+  # one seventh of the price, and a mail that quoted either would tell the
+  # booker something no invoice will ever say.
+  defp booker_email(user, email, ad, template_base, subject) do
+    region = user.date_region || Prefs.default(:date_region)
+    purchase = Ads.purchase(ad)
+    locale = get_locale(user.locale)
+
+    # Every one of these three is a translated sentence, and this runs on a
+    # task whose process locale is the installation default - so the member's
+    # locale has to be put on before any of them, or a German booker is told
+    # "21.09.2026 to 27.09.2026".
+    day = in_locale(locale, fn -> ad_period(purchase, region) end)
+    price = in_locale(locale, fn -> ad_price_line(purchase) end)
+    vat = in_locale(locale, fn -> AdsDoc.vat_display(purchase.net_cents) end)
+
+    build_email(user, email, template_base, %{ad: ad, day: day, price: price, vat: vat}, fn ->
+      subject.(day, purchase.days)
+    end)
+  end
+
+  # One day, or the stretch a block runs for, in the reader's date format.
+  defp ad_period(%{days: 1, first_day: day}, region),
+    do: Calendar.strftime(day, DateRegions.pattern(region, :date))
+
+  defp ad_period(%{first_day: first, last_day: last}, region) do
+    pattern = DateRegions.pattern(region, :date)
+
+    gettext("%{from} to %{to}",
+      from: Calendar.strftime(first, pattern),
+      to: Calendar.strftime(last, pattern)
+    )
+  end
+
+  # Always the net after any discount code: this is the figure the invoice will
+  # carry, and a receipt quoting the list price would have the member expecting
+  # a different bill from the one the operator writes off the same purchase.
+  defp ad_price_line(%{days: 1, net_cents: cents}), do: AdsDoc.price_display(cents)
+
+  defp ad_price_line(%{net_cents: cents}),
+    do: gettext("%{amount} € for the whole period (net)", amount: UI.euro_cents(cents))
 
   ## Operator notices (fixed German recipient, no member ever receives them)
 

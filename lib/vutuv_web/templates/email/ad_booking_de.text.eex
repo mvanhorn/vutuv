@@ -1,22 +1,27 @@
 Neue Anzeigenbuchung auf vutuv
 ==============================
 
-Tag:    <%= Calendar.strftime(@ad.day, "%d.%m.%Y") %>
-Preis:  <%= @price %> EUR (netto), Zahlung per Rechnung
-
-Gebucht von @<%= @booker.username %> (<%= @url %><%= @booker.username %>)
-E-Mail: <%= @booker_email %>
+Für die Rechnung
+----------------
+<%= render "_ad_invoice_de.text", %{invoice: @invoice} %>
+Gebucht von:  @<%= @booker.username %> (<%= @url %><%= @booker.username %>)
 
 Rechnungsadresse
 ----------------
 <%= @billing_address %>
 
-Anzeigentext (Markdown, <%= String.length(@ad.content) %> Zeichen)
-------------------------------------------------------
-<%= @ad.content %>
+Anzeige
+-------
+Titel: <%= @ad.title %>
+Text:  <%= @ad.body %>
+Link:  <%= @ad.url %>
 
 Die Anzeige ist noch NICHT freigeschaltet. Bitte prüfen (familienfreundlich?)
-und freischalten: <%= @url %>admin/ads
+und freischalten: <%= @admin_url %>
 
+Wartet insgesamt auf Freischaltung
+----------------------------------
+<%= for p <- @pending do %>  <%= p.period %>: <%= p.title %><%= if p.username do %> (@<%= p.username %>)<% end %>
+<% end %>
 Die Rechnung wird manuell erstellt und versendet. Die Ausspielung am
 gebuchten Tag erfolgt nach der Freischaltung automatisch.

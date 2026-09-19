@@ -2,23 +2,34 @@ defmodule Vutuv.Ads.Ad do
   @moduledoc """
   A booked text ad: one per calendar day (Europe/Berlin), paid by invoice.
 
-  `content` is Markdown (rendered through `VutuvWeb.Markdown.render/1`, never
-  raw) and capped at 2048 characters. The billing fields are the invoice
-  address the booker entered; together with `price_cents` they make the row
-  the durable record of the order (the invoice itself is sent manually).
+  The ad itself is plain text in the style of classic text ads: a `title` of
+  up to 30 characters that links to `url`, and a `body` sentence of up to
+  90. Readers see where the link goes as `display_url/1`. The billing
+  fields are the invoice address the booker entered; together with
+  `price_cents` they make the row the durable record of the order (the
+  invoice itself is sent manually).
   """
 
   use VutuvWeb, :model
   use Gettext, backend: VutuvWeb.Gettext
 
-  alias Vutuv.Mentions
+  alias Vutuv.ChangesetHelpers
 
-  @content_max_length 2048
+  @title_max_length 30
+  @body_max_length 90
+  @url_max_length 2048
 
   schema "ads" do
     field(:day, :date)
-    field(:content, :string)
+    field(:title, :string)
+    field(:body, :string)
+    field(:url, :string)
     field(:price_cents, :integer)
+
+    # The rows a week or a month was bought as, sharing one id: the review, the
+    # cancellation and "My bookings" act on the whole purchase, while serving,
+    # the unique index and the counters stay per day. A single day has none.
+    field(:group_id, Vutuv.UUIDv7)
 
     field(:billing_name, :string)
     field(:billing_company, :string)
@@ -28,16 +39,83 @@ defmodule Vutuv.Ads.Ad do
     field(:billing_country, :string)
     field(:vat_id, :string)
 
+    # Which of the booker's own addresses the invoice goes to. Checked against
+    # their list in `Vutuv.Ads.book_ad/3`, never trusted from the form.
+    field(:invoice_email, :string)
+
+    # What a discount code took off this row, stamped beside the price it was
+    # booked at: the invoice is written from the pair, so neither is recomputed
+    # later from a code that has since expired or been deleted.
+    field(:discount_cents, :integer, default: 0)
+    belongs_to(:discount_code, Vutuv.Ads.DiscountCode)
+
     # The admin review gate: an ad only serves once approved_at is set
     # (see Vutuv.Ads.approve_ad/2 and current_banner/0).
     field(:approved_at, :utc_datetime)
     belongs_to(:approved_by, Vutuv.Accounts.User)
 
+    # The two ways a booking ends before its day, both of which free the day:
+    # an admin turns it down with a reason (`Vutuv.Ads.reject_ad/3`), or it is
+    # withdrawn (`cancel_booking/2`, `cancel_ad/2`).
+    field(:rejected_at, :utc_datetime)
+    belongs_to(:rejected_by, Vutuv.Accounts.User)
+    field(:rejection_reason, :string)
+    field(:cancelled_at, :utc_datetime)
+    belongs_to(:cancelled_by, Vutuv.Accounts.User)
+
+    # Cards seen and title links clicked (`Vutuv.Ads.count_view/1`).
+    field(:views_count, :integer, default: 0)
+    field(:clicks_count, :integer, default: 0)
+
     belongs_to(:user, Vutuv.Accounts.User)
     timestamps()
   end
 
-  def content_max_length, do: @content_max_length
+  def title_max_length, do: @title_max_length
+  def body_max_length, do: @body_max_length
+  def url_max_length, do: @url_max_length
+
+  @doc """
+  The three lines an ad is made of, validated. Shared with
+  `Vutuv.Ads.Creative`, which is the same text saved for re-use: a member who
+  saves an ad and then cannot book it, or the other way round, would have met
+  two different sets of rules.
+  """
+  def validate_text(changeset) do
+    changeset
+    |> ChangesetHelpers.trim_fields([:title, :body, :url])
+    |> validate_required([:title, :body, :url])
+    |> validate_length(:title, max: @title_max_length)
+    |> validate_length(:body, max: @body_max_length)
+    |> validate_length(:url, max: @url_max_length)
+    |> ChangesetHelpers.validate_url(:url)
+  end
+
+  @doc """
+  Where a booking stands: `:pending` until an admin decides, then `:approved`
+  or `:rejected`; `:cancelled` once withdrawn, whatever it was before.
+  """
+  def status(%__MODULE__{cancelled_at: at}) when not is_nil(at), do: :cancelled
+  def status(%__MODULE__{rejected_at: at}) when not is_nil(at), do: :rejected
+  def status(%__MODULE__{approved_at: at}) when not is_nil(at), do: :approved
+  def status(%__MODULE__{}), do: :pending
+
+  @doc "The reason a booking is turned down with, which the booker reads."
+  def rejection_changeset(ad, reason) do
+    ad
+    |> cast(%{rejection_reason: reason}, [:rejection_reason])
+    |> ChangesetHelpers.trim_fields([:rejection_reason])
+    |> validate_required([:rejection_reason])
+    |> validate_length(:rejection_reason, max: 2000)
+  end
+
+  @doc """
+  Where an ad's link goes, as a reader checks it: the host without `www.` and
+  the path, never the query or the fragment a booker's tracking rides on
+  (`Vutuv.WebVerification.normalize_url/1`). Empty for an ad booked in the old
+  Markdown format, which has no link.
+  """
+  def display_url(url), do: Vutuv.WebVerification.normalize_url(url)
 
   @doc """
   The booking changeset. `user_id` and `price_cents` are set programmatically
@@ -47,26 +125,30 @@ defmodule Vutuv.Ads.Ad do
     model
     |> cast(params, [
       :day,
-      :content,
+      :title,
+      :body,
+      :url,
       :billing_name,
       :billing_company,
       :billing_street,
       :billing_zip_code,
       :billing_city,
       :billing_country,
-      :vat_id
+      :vat_id,
+      :invoice_email,
+      :discount_code_id
     ])
+    |> validate_text()
+    # The country is optional: most invoices go to the same country the
+    # installation bills from, where writing it out says nothing, and an
+    # address abroad carries it in the street or city line anyway.
     |> validate_required([
       :day,
-      :content,
       :billing_name,
       :billing_street,
       :billing_zip_code,
-      :billing_city,
-      :billing_country
+      :billing_city
     ])
-    |> validate_length(:content, max: @content_max_length)
-    |> Mentions.validate_mentions_exist(:content)
     # The billing fields are free-text varchar(255) columns: an oversized value
     # must be a changeset error, never a raised Postgres 22001 on booking.
     |> validate_length(:billing_name, max: 255)
@@ -76,6 +158,7 @@ defmodule Vutuv.Ads.Ad do
     |> validate_length(:billing_city, max: 255)
     |> validate_length(:billing_country, max: 255)
     |> validate_length(:vat_id, max: 255)
+    |> validate_length(:invoice_email, max: 255)
     |> validate_future_day()
     |> unique_constraint(:day, message: "has already been booked")
   end

@@ -1,38 +1,50 @@
 <.page_header
   title={gettext("My ad bookings")}
   crumbs={[
-    {gettext("Advertising"), ~p"/ads"},
+    {gettext("Advertising"), ~p"/system/ads"},
     gettext("My bookings")
   ]}
 />
 
 <div class="card-list">
   <section class="card">
-    <%= if @ads == [] do %>
+    <%= if @bookings == [] do %>
       <p class="card__empty">{gettext("You have not booked an ad yet.")}</p>
       <div class="mt-4">
-        <.button href={~p"/ads/new"}>{gettext("Book your ad")}</.button>
+        <.button href={~p"/system/ads/new"}>{gettext("Book your ad")}</.button>
       </div>
     <% else %>
+      <%!-- One row per purchase: a week is one thing that was bought, and
+      every control on it acts on the whole block (Vutuv.Ads.move/3). --%>
       <div class="divide-y divide-slate-100 dark:divide-slate-800">
-        <div :for={ad <- @ads} id={"booking-#{ad.id}"} class="py-4 first:pt-0 last:pb-0">
+        <div
+          :for={booking <- @bookings}
+          id={"booking-#{booking.ad.id}"}
+          class="py-4 first:pt-0 last:pb-0"
+        >
           <div class="flex flex-wrap items-center gap-3">
-            <span class="text-lg font-bold text-slate-900 dark:text-slate-100">{ad.day}</span>
-            <VutuvWeb.AdHTML.status_badge ad={ad} />
-            <span class="ml-auto text-sm text-slate-600 dark:text-slate-400">
-              {VutuvWeb.AgentDocs.AdsDoc.price_display()}
+            <span class="text-lg font-bold text-slate-900 dark:text-slate-100">
+              {VutuvWeb.AdHTML.period_label(booking.ad.day, booking.days)}
+            </span>
+            <VutuvWeb.AdHTML.status_badge ad={booking.ad} />
+            <span class="ml-auto text-right text-sm text-slate-600 dark:text-slate-400">
+              {VutuvWeb.AdHTML.booked_price(booking)}
+              <span :if={VutuvWeb.AgentDocs.AdsDoc.vat_display(booking.price_cents)} class="block text-xs">
+                {VutuvWeb.AgentDocs.AdsDoc.vat_display(booking.price_cents)}
+              </span>
             </span>
           </div>
-          <p :if={is_nil(ad.approved_at)} class="mt-1 text-xs text-slate-600 dark:text-slate-400">
-            {gettext("We review every ad before it runs. You will see the approval here.")}
-          </p>
-          <div class="markdown mt-2 rounded-lg bg-slate-50 p-3 text-sm text-slate-700 dark:bg-slate-800/60 dark:text-slate-300">
-            {VutuvWeb.Markdown.render(ad.content)}
-          </div>
+          <VutuvWeb.AdHTML.ad_outcome ad={booking.ad} />
+          <VutuvWeb.AdComponents.ad_preview
+            id={"booking-#{booking.ad.id}-ad"}
+            banner={{:ad, booking.ad}}
+            class="mt-3"
+          />
+          <VutuvWeb.AdHTML.booking_actions ad={booking.ad} />
         </div>
       </div>
       <div class="mt-6">
-        <.button href={~p"/ads/new"} variant="secondary">{gettext("Book another day")}</.button>
+        <.button href={~p"/system/ads/new"} variant="secondary">{gettext("Book another day")}</.button>
       </div>
     <% end %>
   </section>

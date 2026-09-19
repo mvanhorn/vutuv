@@ -1,0 +1,18 @@
+<%= email_greeting(@user) %>,
+
+purtroppo non possiamo pubblicare la tua pubblicità per il <%= @day %>:
+
+  <%= @ad.title %>
+  <%= @ad.body %>
+  <%= @ad.url %>
+
+La nostra motivazione: <%= @ad.rejection_reason %>
+
+La prenotazione è quindi annullata, non paghi nulla e il giorno è di nuovo
+libero. Puoi prenotare una nuova pubblicità qui:
+
+<%= @url %>system/ads/new
+
+<%= render "_signature_it.text" %>
+
+<%= render "_footer.text" %>

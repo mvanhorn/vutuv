@@ -86,7 +86,9 @@ defmodule Vutuv.Factory do
     %Vutuv.Ads.Ad{
       day: Vutuv.Ads.first_bookable_day(),
       approved_at: DateTime.truncate(DateTime.utc_now(), :second),
-      content: sequence(:ad_content, &"**Ad #{&1}** content"),
+      title: sequence(:ad_title, &"Ad #{&1}"),
+      body: "A sentence about what is on offer.",
+      url: sequence(:ad_url, &"https://shop-#{&1}.example/offer"),
       price_cents: Vutuv.Ads.price_cents(),
       billing_name: sequence(:billing_name, &"Billing Name #{&1}"),
       billing_street: "Musterstraße 1",
@@ -94,6 +96,35 @@ defmodule Vutuv.Factory do
       billing_city: "Berlin",
       billing_country: "Deutschland"
     }
+  end
+
+  # A booked ad a member saw (Vutuv.Ads.record_sighting/3); pass `user` and
+  # `ad`, and the times when they matter. `insert_ad_sighting/3` builds both.
+  def ad_sighting_factory do
+    now = DateTime.utc_now(:second)
+
+    %Vutuv.Ads.Sighting{
+      first_seen_at: now,
+      last_seen_at: now,
+      times_seen: 1
+    }
+  end
+
+  @doc """
+  `user`'s sighting of the booked ad that ran on `day`, last seen at `at`
+  (noon UTC that day). `title`, `body` and `url` go to the ad, everything
+  else to the sighting. An ad's `day` is unique, so two async test modules must not share
+  one.
+  """
+  def insert_ad_sighting(user, day, attrs \\ []) do
+    {ad_attrs, attrs} = Keyword.split(attrs, [:title, :body, :url])
+    at = Keyword.get(attrs, :at, DateTime.new!(day, ~T[12:00:00]))
+
+    insert(
+      :ad_sighting,
+      [user: user, ad: insert(:ad, [day: day] ++ ad_attrs), first_seen_at: at, last_seen_at: at] ++
+        Keyword.delete(attrs, :at)
+    )
   end
 
   def oauth_app_factory do

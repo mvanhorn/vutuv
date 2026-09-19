@@ -19,6 +19,7 @@ defmodule VutuvWeb.NewsfeedController do
 
   alias Vutuv.Posts
   alias Vutuv.Prefs
+  alias VutuvWeb.AdServing
   alias VutuvWeb.AgentDocs
   alias VutuvWeb.AgentDocs.FeedDoc
   alias VutuvWeb.ApiV2
@@ -48,10 +49,23 @@ defmodule VutuvWeb.NewsfeedController do
   defp show_html(conn, params) do
     conn
     |> AgentDocs.put_html_alternates()
-    |> ControllerHelpers.render_live(Feed, %{
-      "cal_day" => params["day"],
-      "cal_open" => params["cal"]
-    })
+    |> serve_ad()
+    |> render_feed_live(params)
+  end
+
+  # The daily text ad: in the rail, and under the control row on a phone. A
+  # visitor is sent to the login by the feed itself, so none is chosen.
+  defp serve_ad(conn) do
+    if conn.assigns[:current_user], do: AdServing.serve(conn), else: conn
+  end
+
+  defp render_feed_live(conn, params) do
+    session =
+      conn
+      |> AdServing.session()
+      |> Map.merge(%{"cal_day" => params["day"], "cal_open" => params["cal"]})
+
+    ControllerHelpers.render_live(conn, Feed, session)
   end
 
   defp send_feed_doc(conn, format, params) do
