@@ -48,6 +48,36 @@ defmodule VutuvWeb.UserHTML do
     do: not as_owner? and (current_user == nil or fediverse != nil or posts_total > 0)
 
   @doc """
+  Whether a visitor gets the address card: only once an address names a city,
+  since a lone country or postal code has nothing to show and no map to open.
+  The owner keeps the card to manage what is there, and the JSON-LD reads the
+  same answer so the markup never carries an address the page hides.
+  """
+  def address_card?(addresses), do: Enum.any?(addresses, &Vutuv.Address.city?/1)
+
+  # One address on the profile card: the description (optional, a
+  # welcome-page location may carry none, so the line drops out rather than
+  # leaving a gap) over the muted address lines. The card renders it inside
+  # the map link or, with no map to open, on its own. `format_address/2`
+  # wraps the lines in a `<p>`, whose global bottom margin would leave the
+  # link's hover tint lopsided, hence the `[&_p]:mb-0`.
+  attr(:address, :map, required: true)
+  attr(:locale, :string, default: nil)
+
+  defp address_text(assigns) do
+    ~H"""
+    <div class="min-w-0 leading-snug">
+      <div :if={@address.description} class="font-medium text-slate-800 dark:text-slate-100">
+        {@address.description}
+      </div>
+      <div class="text-slate-600 dark:text-slate-400 [&_p]:mb-0">
+        {format_address(@address, @locale)}
+      </div>
+    </div>
+    """
+  end
+
+  @doc """
   One compact user row (avatar, name, work line, follow/unfollow) shared by
   the profile page's "Who to follow" rail and the follower/following preview
   cards. Callers pass the page-wide `work_info_by_id` / `following_by_id`
