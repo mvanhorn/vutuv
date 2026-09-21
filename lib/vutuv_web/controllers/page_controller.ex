@@ -2,7 +2,6 @@ defmodule VutuvWeb.PageController do
   use VutuvWeb, :controller
   plug(:display_pin_entry when action in [:index])
   plug(VutuvWeb.Plug.RequireUserLoggedOut when action in [:index])
-  alias Vutuv.Accounts.Email
   alias Vutuv.Accounts.User
   alias Vutuv.Fediverse
   alias Vutuv.Languages
@@ -10,6 +9,7 @@ defmodule VutuvWeb.PageController do
   alias Vutuv.SourceRepo
   alias VutuvWeb.AgentDocs
   alias VutuvWeb.ControllerHelpers
+  alias VutuvWeb.ErrorHelpers
   alias VutuvWeb.OpenGraph
   alias VutuvWeb.Plug.Locale
   alias VutuvWeb.RateLimit
@@ -17,47 +17,25 @@ defmodule VutuvWeb.PageController do
   # The one :machine_docs document with translated content — see webmanifest/2.
   plug(Locale when action in [:webmanifest])
 
+  # Sign-up is three steps and lives in `VutuvWeb.RegistrationLive`, embedded by
+  # the template. This action therefore builds no changeset for it any more: the
+  # form's defaults are that module's `default_fields/0` and its validation runs
+  # per step against the same `User` / `Email` changesets the submit uses.
+  #
+  # `form_state` is nil here and set only by the rejected submit below, which is
+  # the one path that has something for the wizard to come back to.
   def index(conn, _params) do
-    # Sign-up form defaults: pre-check "show on profile" (public?: true) and
-    # preselect the "Personal" email type (most people sign up with their
-    # private address). These prime the form's controls only - the User/Email
-    # schemas keep their own defaults for every other code path, so an address
-    # created without an explicit choice still stays private.
-    #
-    # The gender question is the one control deliberately left UNSET, and it is
-    # the only field on this form where that is a decision rather than an
-    # omission. This exact group was once preselected to "männlich", so every
-    # woman signing up had to correct an assumption about herself before typing
-    # her name, and members wrote in about it. Nothing may fill it in for them:
-    # an unset group asks, a preselected one assumes.
-    #
-    # The Fediverse box is pre-checked the same way: most people who join want
-    # the connection to Mastodon and friends, and sign-up is the one moment
-    # every member passes through, while the switch on /settings/fediverse is
-    # one hardly anybody goes looking for. It stays a visible question with a
-    # line of explanation next to it, and unticking it is one click. Primed to
-    # `false` where the installation federates nothing at all
-    # (FEDIVERSE_ENABLED=false, intranets), which is also where the template
-    # leaves the whole question out.
-    #
-    # One question, all three switches: a ticked box is expanded by
-    # `expand_fediverse_choice/1` below into taking part *plus* the reactions
-    # and replies that come back, because that is what "take part" means to
-    # somebody reading it, and the box's own text says so.
-    changeset =
-      %User{fediverse_followers?: Fediverse.enabled?()}
-      |> User.changeset()
-      |> Ecto.Changeset.put_assoc(:emails, [%Email{public?: true, email_type: "Personal"}])
-
-    render_landing(conn, changeset: changeset)
+    render_landing(conn, [])
   end
 
   # The one way to render the landing page, because it is rendered from two
   # actions: `index` and the rejected sign-up below, which shows the identical
   # screen with the errors on it. Any assign the template grows belongs here and
   # not in `index`, or the rejected sign-up raises KeyError on it — i.e. a 500 on
-  # every mistyped form, which is how that rule was learned.
+  # every mistyped form, which is how that rule was learned. `form_state` is
+  # defaulted here for exactly that reason.
   defp render_landing(conn, assigns) do
+    assigns = Keyword.put_new(assigns, :form_state, nil)
     # Every example on this page is a static screenshot in the template, so the
     # landing page loads nothing of its own. It used to show a wall of real
     # posts from a cached snapshot; that came out again because a socket and a
@@ -298,30 +276,32 @@ defmodule VutuvWeb.PageController do
       |> expand_fediverse_choice()
       |> Prefs.drop_unchosen_booleans()
 
-    # Extract defensively: a malformed "emails" param (not the nested
-    # %{"0" => %{"value" => …}} the form produces) must reach register_user/2
-    # as a plain error changeset, not crash on chained Access indexing.
-    email =
-      case user_params do
-        %{"emails" => %{"0" => %{"value" => value}}} -> value
-        _ -> nil
-      end
-
+    # Neither branch below derives the address from the params any more, and
+    # that is the whole repair: the address was extracted here, matching
+    # `emails[0]` alone, while `cast_assoc` casts whichever single entry was
+    # posted and `first_email_value/1` reads what was stored. Three derivations
+    # of one fact, and a POST that spelled the address anywhere else made them
+    # disagree — a nil into `String.downcase/2`, on an unauthenticated endpoint.
+    # `rejected_form_state/2` keeps its own params read, because putting a
+    # refused value back in the form is genuinely a question about what was
+    # posted rather than about what was saved.
     case Vutuv.Accounts.register_user(conn, user_params) do
-      {:ok, _user} ->
-        handle_post_registration_login(conn, email)
+      {:ok, user} ->
+        handle_post_registration_login(conn, Vutuv.Accounts.first_email_value(user))
 
       {:error, changeset} ->
-        if Vutuv.Accounts.email_already_taken?(changeset) do
-          # Don't betray that the address exists: render the identical screen a
-          # fresh sign-up gets, and let the owner's inbox carry the truth (a
-          # "someone tried to register" notice with a login link). Surfacing the
-          # "has already been taken" error here would be an enumeration oracle.
-          handle_existing_email_registration(conn, email)
-        else
-          conn
-          |> put_status(:unprocessable_entity)
-          |> render_landing(changeset: changeset)
+        # Don't betray that the address exists: render the identical screen a
+        # fresh sign-up gets, and let the owner's inbox carry the truth (a
+        # "someone tried to register" notice with a login link). Surfacing the
+        # "has already been taken" error here would be an enumeration oracle.
+        case Vutuv.Accounts.taken_email(changeset) do
+          nil ->
+            conn
+            |> put_status(:unprocessable_entity)
+            |> render_landing(form_state: rejected_form_state(user_params, changeset))
+
+          taken ->
+            handle_existing_email_registration(conn, taken)
         end
     end
   end
@@ -350,6 +330,74 @@ defmodule VutuvWeb.PageController do
   end
 
   defp expand_fediverse_choice(params), do: params
+
+  # What a rejected submit hands back to `VutuvWeb.RegistrationLive` so the
+  # wizard reopens on its last step with the errors on it, rather than dropping
+  # somebody who mistyped back onto an empty first step.
+  #
+  # Only the fields the wizard itself renders are carried, each capped: this
+  # endpoint is unauthenticated and takes whatever is posted, and the map is
+  # signed into the page as the embedded LiveView's mount session, so an
+  # unbounded POST would otherwise decide how big every rejected render is.
+  @carried_fields ~w(first_name last_name gender noindex? noai? fediverse_followers? low_bandwidth? tag_list)
+  @carried_length 512
+
+  defp rejected_form_state(user_params, changeset) do
+    carried =
+      for key <- @carried_fields,
+          {:ok, value} <- [Map.fetch(user_params, key)],
+          is_binary(value),
+          into: %{},
+          do: {key, String.slice(value, 0, @carried_length)}
+
+    email =
+      case user_params do
+        %{"emails" => %{"0" => %{"value" => value}}} when is_binary(value) ->
+          String.slice(value, 0, @carried_length)
+
+        _ ->
+          nil
+      end
+
+    public? =
+      case user_params do
+        %{"emails" => %{"0" => %{"public?" => value}}} -> checked_box?(value)
+        _ -> true
+      end
+
+    %{
+      "params" => Map.merge(carried, %{"email" => email, "email_public" => public?}),
+      "errors" => rejected_messages(changeset)
+    }
+  end
+
+  # The banner's reasons, each paired with the field it belongs to, so the
+  # wizard can mark that field rather than only listing the sentence — which is
+  # what makes "the fields marked in red" true. The nested address's errors come
+  # along as `email`, the name that form uses; `changeset_messages/1` cannot
+  # reach them on its own.
+  defp rejected_messages(changeset) do
+    nested =
+      changeset
+      |> Ecto.Changeset.get_change(:emails, [])
+      |> Enum.flat_map(fn nested ->
+        Enum.map(ErrorHelpers.changeset_messages(nested), &[form_field(:emails), &1])
+      end)
+
+    own =
+      for {field, error} <- Enum.reverse(changeset.errors),
+          do: [form_field(field), ErrorHelpers.translate_error(error)]
+
+    own ++ nested
+  end
+
+  # `:emails` is the association; `email` is what the form calls the one field
+  # behind it, and only a name that form renders can be marked red
+  # (`RegistrationLive`'s `@marked_fields`). The top-level error exists because
+  # the address is required, so without this the refusal arrived as an unmarked
+  # sentence beside an email field that looked fine.
+  defp form_field(:emails), do: "email"
+  defp form_field(field), do: to_string(field)
 
   defp handle_post_registration_login(conn, email) do
     # The account was just created, so login_by_email/2 always mails the PIN
@@ -498,7 +546,7 @@ defmodule VutuvWeb.PageController do
 
   # The document is a compile-time constant with one hole in it, because one of
   # the pages it lists is optional. `:ads_enabled` ships **off** (config.exs),
-  # and the ad page 404s while it is — so listing `/ads` unconditionally pointed
+  # and the ad page 404s while it is — so listing `/system/ads` unconditionally pointed
   # every installation's agents at a dead URL, vutuv.de included. A discovery
   # file that names a page which is not there is worse than one that stays quiet
   # about a feature.
@@ -515,7 +563,7 @@ defmodule VutuvWeb.PageController do
 
   defp ads_entry do
     if Vutuv.Ads.enabled?() do
-      "- `/ads` — the daily text ad: price, conditions, next available day\n" <>
+      "- `/system/ads` — the daily text ad: price, conditions, next available day\n" <>
         "  (booking happens online and requires a login)\n"
     else
       ""

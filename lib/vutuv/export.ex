@@ -13,6 +13,8 @@ defmodule Vutuv.Export do
 
   alias Vutuv.Accounts.User
   alias Vutuv.Ads.Ad
+  alias Vutuv.Ads.Sighting
+  alias Vutuv.Chat
   alias Vutuv.Chat.{Conversation, Participant}
   alias Vutuv.Fediverse
   alias Vutuv.Fediverse.Note
@@ -20,6 +22,7 @@ defmodule Vutuv.Export do
   alias Vutuv.Fediverse.RemotePost
   alias Vutuv.Images
   alias Vutuv.Jobs.{JobPostingBookmark, JobPostingLike}
+  alias Vutuv.Organizations.Organization
   alias Vutuv.Organizations.{OrganizationBookmark, OrganizationLike}
   alias Vutuv.Posts.{Post, PostBookmark, PostDraft, PostLike, PostRepost}
   alias Vutuv.PressKit
@@ -50,7 +53,10 @@ defmodule Vutuv.Export do
   #    Markdown source, not the rendered prose.
   # 12: the member's private notes about other accounts (`personal_notes`), as
   #    Markdown source, each naming the account it is about.
-  @schema_version 12
+  # 13: the ads the member was shown (`seen_ads`), with when and how often, and
+  #     a booked ad as its title, text and link instead of Markdown `content`,
+  #     with its `status` (and `rejection_reason`) instead of `approved`.
+  @schema_version 13
 
   def build(%User{} = user) do
     user =
@@ -221,8 +227,29 @@ defmodule Vutuv.Export do
       # The three bios of that same kit (issue #2101), as **Markdown source**
       # rather than as rendered prose: it is what the member typed, and it is
       # what they would paste into whatever they move to.
-      press_bios: press_bios(user)
+      press_bios: press_bios(user),
+      # The ads the member was shown, as their "seen ads" page lists them.
+      seen_ads: seen_ads(user)
     }
+  end
+
+  defp seen_ads(user) do
+    Repo.all(
+      from(s in Sighting,
+        join: a in assoc(s, :ad),
+        where: s.user_id == ^user.id,
+        order_by: [asc: s.first_seen_at],
+        select: %{
+          day: a.day,
+          title: a.title,
+          body: a.body,
+          url: a.url,
+          first_seen_at: s.first_seen_at,
+          last_seen_at: s.last_seen_at,
+          times_seen: s.times_seen
+        }
+      )
+    )
   end
 
   defp press_bios(user), do: user |> PressKit.bio() |> Map.take(PressKit.bio_lengths())
@@ -540,25 +567,55 @@ defmodule Vutuv.Export do
       join: part in Participant,
       on: part.conversation_id == c.id and part.user_id == ^user.id,
       order_by: [asc: c.id],
-      preload: [participants: :user, messages: :sender]
+      preload: [
+        :remote_account,
+        participants: :user,
+        messages: [:sender, :sender_organization, :sender_remote_account]
+      ]
     )
     |> Repo.all()
     |> Enum.map(fn c ->
-      others =
-        for p <- c.participants, p.user_id != user.id, p.user, do: p.user.username
-
       %{
-        with: others,
+        with: counterparts(c, user),
         status: c.status,
         started_at: c.inserted_at,
-        messages:
-          Enum.map(
-            c.messages,
-            &%{from: &1.sender && &1.sender.username, body: &1.body, at: &1.inserted_at}
-          )
+        messages: Enum.map(c.messages, &exported_message/1)
       }
     end)
   end
+
+  # Who the member was writing with. An account on another network has no
+  # participant row — nobody over there reads anything here — so it is named
+  # off the conversation itself, or a member asking what vutuv holds about them
+  # would be handed an exchange with nobody in it.
+  defp counterparts(%Conversation{remote_account: %RemoteAccount{} = account}, _user),
+    do: [author_name(account)]
+
+  defp counterparts(conversation, user),
+    do: for(p <- conversation.participants, p.user_id != user.id, p.user, do: p.user.username)
+
+  # Through `Chat.sender/1`, never off a column: a message here can be written
+  # by a member, by a page or by an account on another network, and reading
+  # `sender.username` answered `nil` for the two that are not a member — so a
+  # page's own reply exported as "from: null".
+  defp exported_message(message) do
+    %{
+      from: message |> Chat.sender() |> author_name(),
+      body: message.body,
+      at: message.inserted_at
+    }
+  end
+
+  # The address rather than the display name: an export is a record, and a name
+  # is whatever somebody typed into their profile this week. Every kind answers
+  # through `Vutuv.Identity.handle/1`, with the one fallback that kind has when
+  # it carries no handle at all.
+  defp author_name(%RemoteAccount{} = account),
+    do: Vutuv.Identity.handle(account) || RemoteAccount.label(account)
+
+  defp author_name(%User{username: username}), do: username
+  defp author_name(%Organization{} = page), do: Vutuv.Identity.handle(page) || page.slug
+  defp author_name(nil), do: nil
 
   defp ad_bookings(user) do
     from(a in Ad, where: a.user_id == ^user.id, order_by: [asc: a.day])
@@ -566,9 +623,12 @@ defmodule Vutuv.Export do
     |> Enum.map(fn ad ->
       %{
         day: ad.day,
-        content: ad.content,
+        title: ad.title,
+        body: ad.body,
+        url: ad.url,
         price_cents: ad.price_cents,
-        approved: ad.approved_at != nil,
+        status: Ad.status(ad),
+        rejection_reason: ad.rejection_reason,
         billing:
           Map.take(ad, [
             :billing_name,

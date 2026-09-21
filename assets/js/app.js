@@ -60,6 +60,13 @@ import "./compose_tab"
 // Pulling the feed down at the top of the page presses the waiting-posts pill;
 // registered as the PullToReveal hook below. See pull_to_reveal.js.
 import { PullToReveal } from "./pull_to_reveal"
+// The daily text ad's card on a profile and in the feed: its two-minute
+// lifetime and the day its ✕ closed (see ad_slot.js).
+import { AdSlot } from "./ad_slot"
+import { AdCalendar } from "./ad_calendar"
+// The booking wizard's half-written ad, kept in the browser so a stray pull at
+// the top of the page cannot reload it away (see ad_draft.js).
+import { AdDraft } from "./ad_draft"
 // The card behind a `@user@host` mention in a post: who that is, and a Follow
 // button, instead of leaving the site for their server (self-contained; its
 // panel lives on <body>, outside every LiveView root. See mention_card.js).
@@ -1137,12 +1144,69 @@ const NewMarks = {
   },
 }
 
+// Native <dialog> modals on classic pages: a control carrying
+// `data-modal-open="<id>"` opens that dialog, anything inside it carrying
+// `data-modal-close` closes it. Delegated, so markup rendered later works too.
+//
+// A <dialog> rather than `data-confirm` wherever the CONSEQUENCE is the thing
+// that has to be read: a native confirm gives one unstyled line, and "there is
+// no money back" does not fit in one line anybody reads.
+document.addEventListener("click", (event) => {
+  const opener = event.target.closest("[data-modal-open]")
+  if (opener) {
+    const dialog = document.getElementById(opener.dataset.modalOpen)
+    if (dialog && typeof dialog.showModal === "function") {
+      event.preventDefault()
+      dialog.showModal()
+    }
+    return
+  }
+
+  const closer = event.target.closest("[data-modal-close]")
+  if (closer) {
+    const dialog = closer.closest("dialog")
+    if (dialog) {
+      event.preventDefault()
+      dialog.close()
+    }
+  }
+})
+
+// The sign-up form's tag field: a comma finishes a tag, and the browser has to
+// be the one that shortens the field. LiveView deliberately never overwrites
+// the value of a FOCUSED input — it would throw away what somebody is in the
+// middle of typing — so a server that clears the field has no effect at all
+// while the cursor is still in it, and "Hund," stays on screen beside the badge
+// it just became. So the hook cuts the finished part out of the DOM value and
+// tells the server both halves in one event: what was finished, and what it
+// left standing. The two then agree, and the next patch has nothing to correct.
+//
+// It reads only its own input, never the server's echo, so the late-echo trap
+// the composer's editor documents cannot form here.
+const TagComma = {
+  mounted() {
+    this.el.addEventListener("input", () => {
+      if (!this.el.value.includes(",")) return
+
+      const parts = this.el.value.split(",")
+      const rest = parts.pop().replace(/^\s+/, "")
+
+      this.el.value = rest
+      this.pushEvent("add_typed", { value: parts.join(","), rest })
+    })
+  },
+}
+
 const Hooks = {
   MarkdownEditor,
   TagInput,
+  TagComma,
   FeedUrl,
   NewMarks,
   PullToReveal,
+  AdSlot,
+  AdCalendar,
+  AdDraft,
   LocalTime: {
     mounted() {
       localizeTime(this.el)
@@ -2555,81 +2619,6 @@ function setupTagVotes() {
 }
 onReady(setupTagVotes)
 
-// Map links on the profile address card (user/show + Vutuv.Maps). A logged-in
-// viewer has a default map service rendered as the primary "Open in …" button,
-// the rest as a quiet "Also on" line. Clicking an alternative promotes it: the
-// map opens in a new tab, the clicked service becomes the primary button on
-// every address row at once, and the new default is persisted (keepalive POST,
-// so it survives the tab switch). The links are real <a> tags, so with JS off
-// they still open — the default just stays put. Rows without a persist URL
-// (logged-out visitors) are left as plain links. Classic controller page, so
-// plain JS (no LiveView here).
-function mapSnapshot(link) {
-  return {
-    service: link.dataset.service,
-    href: link.getAttribute("href"),
-    labelPrimary: link.dataset.labelPrimary,
-    labelAlt: link.dataset.labelAlt,
-  }
-}
-
-function mapApply(link, data, asPrimary) {
-  link.dataset.service = data.service
-  link.setAttribute("href", data.href)
-  link.dataset.labelPrimary = data.labelPrimary
-  link.dataset.labelAlt = data.labelAlt
-  const text = link.querySelector("[data-map-text]")
-  if (text) text.textContent = asPrimary ? data.labelPrimary : data.labelAlt
-}
-
-// Across every address row, swap the primary button with the matching
-// alternative so `service` reads as the primary everywhere at once.
-function promoteMapDefault(service) {
-  document.querySelectorAll("[data-map-row]").forEach((row) => {
-    const primary = row.querySelector("[data-map-primary]")
-    if (!primary || primary.dataset.service === service) return
-    const alt = row.querySelector(`[data-map-alt][data-service="${service}"]`)
-    if (!alt) return
-    const wasPrimary = mapSnapshot(primary)
-    const wasAlt = mapSnapshot(alt)
-    mapApply(primary, wasAlt, true)
-    mapApply(alt, wasPrimary, false)
-  })
-}
-
-function persistMapDefault(url, service) {
-  try {
-    request(url, {
-      method: "POST",
-      keepalive: true,
-      headers: { "content-type": "application/x-www-form-urlencoded" },
-      body: `service=${encodeURIComponent(service)}`,
-    })
-  } catch (_e) {
-    // Best effort: a reload re-reads the stored default anyway.
-  }
-}
-
-function wireMapRow(row) {
-  if (!once(row, "map")) return
-  const persistUrl = row.dataset.mapPersistUrl
-  if (!persistUrl) return // logged-out: plain links, no promotion
-  row.querySelectorAll("[data-map-alt]").forEach((alt) => {
-    alt.addEventListener("click", (e) => {
-      e.preventDefault()
-      const service = alt.dataset.service
-      window.open(alt.getAttribute("href"), "_blank", "noopener,noreferrer")
-      promoteMapDefault(service)
-      persistMapDefault(persistUrl, service)
-    })
-  })
-}
-
-function setupMapLinks() {
-  document.querySelectorAll("[data-map-row]").forEach(wireMapRow)
-}
-onReady(setupMapLinks)
-
 // The viewer's own time zone (issue #1502). The browser is the only side that
 // knows it, so it fills two things: the sign-up form's hidden field, which
 // stamps the new account with its zone (Vutuv.Accounts), and the hint under the
@@ -3107,9 +3096,10 @@ function setupBrowserNotifications() {
 onReady(setupBrowserNotifications)
 
 // Live character counter for a length-capped text field (the profile Tagline,
-// see user/edit.html.heex). A [data-char-counter] wrapper with data-max holds a
-// [data-char-count-input] field and a [data-char-count-readout] showing
-// "N/max characters"; as the writer types we update the number and flip the
+// the ad booking form). A [data-char-counter] wrapper holds a
+// [data-char-count-input] field and the [data-char-count-readout] that
+// VutuvWeb.UI.char_count/1 renders, which names the cap in its data-max and
+// shows "N/max characters"; as the writer types we update the number and flip the
 // readout to its over-limit state (red, ⚠ instead of ✓) so they can tell at a
 // glance whether they trimmed enough before submitting. Server-side
 // validate_length stays the source of truth — this only spares a round-trip.
@@ -3121,7 +3111,7 @@ function wireCharCounter(wrap) {
   const output = wrap.querySelector("[data-char-count]")
   const ok = wrap.querySelector("[data-char-ok]")
   const over = wrap.querySelector("[data-char-over]")
-  const max = parseInt(wrap.dataset.max, 10)
+  const max = readout && parseInt(readout.dataset.max, 10)
   if (!input || !readout || !output || !max) return
 
   const update = () => {
@@ -3552,31 +3542,6 @@ function setupFediverseConsent() {
   })
 }
 onReady(setupFediverseConsent)
-
-// The ad banner (layout strip between navigation and content, see
-// VutuvWeb.Plug.AdBanner) disappears on its own after two minutes: fade out,
-// then drop the node. Its ✕ removes it immediately AND keeps ads away for
-// the rest of the (Berlin) day: the cookie value is the day stamped onto the
-// button by the server, which the plug compares against its own "today".
-// Classic controller pages only, so plain JS suffices.
-onReady(() => {
-  const ad = document.querySelector("[data-ad-banner]")
-  if (!ad || !once(ad, "adBanner")) return
-
-  const close = ad.querySelector("[data-ad-close]")
-  if (close) {
-    close.addEventListener("click", () => {
-      document.cookie = `vutuv_ad_dismissed=${close.dataset.adDay}; path=/; max-age=86400; samesite=lax`
-      ad.remove()
-    })
-  }
-
-  setTimeout(() => {
-    ad.style.transition = "opacity 0.5s ease"
-    ad.style.opacity = "0"
-    setTimeout(() => ad.remove(), 500)
-  }, 120000)
-})
 
 // Card ⋯ menus (<details data-menu>, see VutuvWeb.UI.card_menu): the native
 // <details> toggle does everything except light-dismiss, so close any open

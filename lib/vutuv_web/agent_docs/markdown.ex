@@ -15,6 +15,7 @@ defmodule VutuvWeb.AgentDocs.Markdown do
 
   alias Vutuv.Accounts.User
   alias Vutuv.CodeStats
+  alias Vutuv.Countries
   alias Vutuv.Isbn
   alias VutuvWeb.AgentDocs.InvestorsDoc
   alias VutuvWeb.PostComponents
@@ -401,7 +402,7 @@ defmodule VutuvWeb.AgentDocs.Markdown do
     |> join_blocks()
   end
 
-  # The /ads offer page (VutuvWeb.AgentDocs.AdsDoc). The rules and the facts
+  # The /system/ads offer page (VutuvWeb.AgentDocs.AdsDoc). The rules and the facts
   # form one loose bullet list (blank-line separated, like every other list),
   # not several one-item lists.
   def render(%{type: "advertising"} = doc) do
@@ -671,7 +672,6 @@ defmodule VutuvWeb.AgentDocs.Markdown do
       User.desired_workplace_line(doc.desired_workplace_types) &&
         "- #{gettext("Preferred workplace")}: #{User.desired_workplace_line(doc.desired_workplace_types)}",
       doc.desired_salary && "- " <> User.desired_salary_agent_line(doc.desired_salary),
-      "- #{gettext("Member since")}: #{doc.member_since}",
       fediverse_fact(doc[:fediverse]),
       count_facts(doc.counts),
       birthday_facts(doc)
@@ -1113,7 +1113,7 @@ defmodule VutuvWeb.AgentDocs.Markdown do
         address.zip_code,
         address.city,
         address.state,
-        address.country
+        Countries.localize_english_name(address.country)
       ]
       |> Enum.filter(&(&1 not in [nil, ""]))
       |> Enum.join(", ")

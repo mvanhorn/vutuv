@@ -3386,6 +3386,23 @@ html[data-feed-pull="busy"] .feed-pull__glyph {
   }
 }
 
+/* ---------- No pull-to-refresh ----------
+
+   The mark any page may set on <html> while it holds a half-written form: the
+   phone's downward drag at the top of the page reloads, which is a thing
+   nobody means to do and which used to cost a whole ad booking. Today the ad
+   wizard's hook sets it on mount and takes it off when the wizard is left
+   (`assets/js/ad_draft.js`), so no other page is quietly changed.
+
+   `none`, not `contain`: only `none` takes the refresh itself off, at the
+   price of that page's elastic bounce. On both elements, because the used
+   value on the root is what propagates to the viewport and Chrome reads it
+   off <body>. */
+html[data-no-pull-refresh],
+html[data-no-pull-refresh] body {
+  overscroll-behavior-y: none;
+}
+
 /* The pill arriving on the compose line, fading in from the right over the
    width the compose button just gave up. The button itself does NOT animate —
    it snaps from `flex-1` to `flex-none` in the same frame the pill is inserted,
@@ -3521,7 +3538,24 @@ html[data-feed-pull="busy"] .feed-pull__glyph {
   }
 }
 
+/* The booking calendar's hover preview (assets/js/ad_calendar.js): with a week
+   or a month chosen, the days the block would occupy light up under the
+   pointer. A tint rather than the picked block's filled brand, so what is
+   already chosen and what is merely being considered never read alike; the
+   picked days keep their own utilities and simply out-paint this. */
+[data-day].is-block-hover {
+  background-color: #dbeafe;
+  color: #1e40af;
+}
+
 @media (prefers-color-scheme: dark) {
+  /* Built on brand-800, never brand-900, which is level with a slate-800 card
+     and would draw nothing (see the dark-tint rule in design.md). */
+  [data-day].is-block-hover {
+    background-color: color-mix(in srgb, #1e3a8a 60%, transparent);
+    color: #dbeafe;
+  }
+
   /* Slate-700: the outline has to read against the dark card it sits in
      (slate-900), not against the light one it was drawn for. */
   .skeleton {

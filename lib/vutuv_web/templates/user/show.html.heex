@@ -9,8 +9,15 @@ public data here, update ProfileDoc too — agent_docs_drift_test.exs fails
 on drift. --%>
 <%!-- md, not lg: portrait iPads (768-834px CSS width) get the desktop
 content+rail columns too; user_row and the rail cards truncate cleanly at
-the resulting ~200px rail width. --%>
-<div class="flex flex-col gap-6 py-6 md:grid md:grid-cols-3">
+the resulting ~200px rail width.
+
+`data-profile-edge`: below md the page runs every card from one edge of the
+screen to the other, with nothing between two cards but the next one's title —
+so no gap and no top padding there (the cover meets the top bar), only from md
+up. The rest of the geometry is one block in the phone section of
+`assets/css/app.css`, keyed on this marker and on `data-card`,
+`data-profile-header` and `data-profile-band` below. --%>
+<div data-profile-edge class="flex flex-col pb-6 md:grid md:grid-cols-3 md:gap-6 md:pt-6">
   <%!-- Below md the page is a single flex column and BOTH columns are `contents`,
   so every card (main content AND rail) is one flex child of this container and
   can be reordered on a phone: Followers / Following / Who-to-follow drop to the
@@ -26,6 +33,7 @@ the resulting ~200px rail width. --%>
     <.frozen_banner
       :if={@as_owner? and Vutuv.Moderation.account_hidden?(@user)}
       class="rounded-2xl px-4 py-3 text-sm"
+      data-profile-band
     >
       {gettext("Only you can see your profile right now - it is hidden while a report is handled.")}
     </.frozen_banner>
@@ -34,7 +42,10 @@ the resulting ~200px rail width. --%>
     <%!-- No overflow-hidden on the section: it would clip the ⋯ actions menu's
     dropdown (which opens downward from the name row). The cover image is clipped
     to the rounded top by its own wrapper below instead. --%>
-    <section class="rounded-2xl bg-white shadow-sm ring-1 ring-slate-200 dark:bg-slate-900 dark:ring-slate-800">
+    <section
+      data-profile-header
+      class="rounded-2xl bg-white shadow-sm ring-1 ring-slate-200 dark:bg-slate-900 dark:ring-slate-800"
+    >
       <%!-- Cover banner: the uploaded cover photo (object-cover crop) when set,
       otherwise the brand gradient. The owner gets a discoverable upload
       affordance overlaid on the banner; it leads to the edit form where the
@@ -56,7 +67,7 @@ the resulting ~200px rail width. --%>
       and keeps the compact h-28 band instead of 185px of empty colour. --%>
       <div
         class={[
-          "relative overflow-hidden rounded-t-2xl",
+          "relative overflow-hidden rounded-t-[inherit]",
           (cover.src && cover_aspect_class()) || "h-28"
         ]}
         data-cover-frame
@@ -107,8 +118,7 @@ the resulting ~200px rail width. --%>
       lights. And MESSAGE is one tap: it left the ⋯ menu, which keeps what is
       rare or heavy. Action controls are per-viewer and never appear in the
       agent-format ProfileDoc, so none of this needs a doc change. --%>
-      <div class="px-6 pb-6">
-        <% member_since = member_since(@user) %>
+      <div data-profile-header-body class="px-6 pb-6">
         <% can_act? = @current_user != nil and not same_user?(@user, @current_user) %>
         <%!-- Exactly the viewer the cond's `can_act?` branch below reaches: a
         signed-in member looking at somebody else, who is not the owner, has not
@@ -256,7 +266,7 @@ the resulting ~200px rail width. --%>
                 {if @header_follow_muted?, do: gettext("Unmute"), else: gettext("Mute")}
               </:item>
               <%!-- Bookmark, Like and now Message are NOT in here any more:
-              the two saves are the glyph toggles in the footer row below, and
+              the two saves are the glyph toggles at the end of the counts row, and
               Message is a control of its own in each arrangement. What is left
               is what nobody reaches for often (Report) and what should not be
               one tap away (Block). --%>
@@ -353,22 +363,26 @@ the resulting ~200px rail width. --%>
           {@work_info}
         </p>
 
-        <% has_counts = @follower_count > 0 or @followee_count > 0 or @connection_count > 0 %>
         <% show_relationship? = viewer_actions? && @header_follows_viewer? %>
         <% show_saves? = saved_present? && !@viewer_block %>
-        <%!-- Facts row: the three counts and the follow-back chip on ONE line,
-        the chip last. It is another fact about this member, so it belongs
-        beside the numbers rather than on a line of its own above them. On a
-        phone the labels give way before the chip does — see
-        `<.profile_counts>` for how, and why that is the right way round. The
-        chip only exists while this member follows the viewer, so with no
-        counts either the row is left out rather than shipped empty. Do not
-        fold the second disjunct away as implied by the first: a member who
-        follows the viewer has a followee, but the counts are visibility-gated
-        and the raw edge is not, so a viewer invisible to those counts (frozen,
-        unreachable) still gets the chip and nothing else on the row. --%>
+        <%!-- The last line of the card: the counts, the follow-back chip, and at
+        the right end the three things a viewer can DO here — download,
+        bookmark, like — as equal 40px glyphs, where a thumb rests and where the
+        same two glyphs sit under every post. They had a row of their own under
+        the counts, which cost a phone a whole line for three icons (Stefan,
+        2026-09-18). The chip is another fact about this member, so it rides
+        beside the numbers rather than on a line of its own. On a phone the
+        labels give way before the chip and the glyphs do, and the connections
+        count leaves the line entirely to make room — see `<.profile_counts>`
+        for how. The line always renders: the vCard is universal (owner and
+        logged-out visitor included), even where no counter and no chip would
+        ride it. The toggles need a logged-in non-owner who has not blocked this
+        member, the same guard the ⋯ menu carries.
+
+        12px between the glyphs on a phone (`gap-3`) so a thumb does not take
+        the neighbour, 4px from `md` up where a pointer is precise; the vCard
+        gets its word back from `sm` up, where there is room for it. --%>
         <.profile_counts
-          :if={has_counts || show_relationship?}
           class="mt-4"
           user={@user}
           follower_count={@follower_count}
@@ -381,29 +395,15 @@ the resulting ~200px rail width. --%>
               follow_id={@header_follow_id}
               follows_viewer?={@header_follows_viewer?}
             />
+            <div class="ml-auto flex shrink-0 items-center gap-3 md:gap-1">
+              <.profile_vcard_link path={vcard_path} />
+              <%= if show_saves? do %>
+                <.profile_save_toggle kind={:bookmark} active?={bookmarked?} />
+                <.profile_save_toggle kind={:like} active?={liked?} />
+              <% end %>
+            </div>
           </:extra>
         </.profile_counts>
-
-        <%!-- Footer: one row that never wraps. "Member since" holds the left
-        and truncates rather than pushing anything down; the three things a
-        viewer can DO here — download, bookmark, like — line up as equal 40px
-        glyphs on the right, where a thumb rests and where the same two glyphs
-        sit under every post. It used to be a `flex-wrap` row, which on a phone
-        dropped the two save glyphs onto a line of their own, right-aligned
-        under an empty band. The vCard gets its word back from `sm` up, where
-        there is room for it. Member-since and vCard are universal (owner and
-        logged-out visitor included); the toggles need a logged-in non-owner
-        who has not blocked this member, the same guard the ⋯ menu carries. --%>
-        <div class="mt-4 flex items-center gap-1 border-t border-slate-100 pt-3 dark:border-slate-800">
-          <.member_since_line :if={member_since} value={member_since} class="my-0 min-w-0 truncate" />
-          <div class="ml-auto flex shrink-0 items-center gap-0.5 sm:gap-1">
-            <.profile_vcard_link path={vcard_path} />
-            <%= if show_saves? do %>
-              <.profile_save_toggle kind={:bookmark} active?={bookmarked?} />
-              <.profile_save_toggle kind={:like} active?={liked?} />
-            <% end %>
-          </div>
-        </div>
       </div>
     </section>
 
@@ -425,9 +425,14 @@ the resulting ~200px rail width. --%>
     undone, and gone once every step is done or the owner closes it with the ×
     (which persists, so it stays gone); @show_completion? carries that gate (see
     UserProfileLive). Each todo links straight to where it is done. --%>
+    <%!-- The daily text ad on a phone, right under the header; the desktop
+    copy leads the rail. --%>
+    <VutuvWeb.AdComponents.ad_slot ad={@ad_slot} placement={:inline} viewer={@current_user} />
+
     <section
       :if={@show_completion?}
       id="profile-completion"
+      data-profile-band
       class="rounded-2xl bg-brand-50 p-6 ring-1 ring-brand-100 dark:bg-brand-800/30 dark:ring-brand-900/50"
     >
       <% done_count = Enum.count(@completion_steps, & &1.done) %>
@@ -484,7 +489,11 @@ the resulting ~200px rail width. --%>
     <%!-- `data-filter-scope`: the filter tabs and the post list they govern in
     one container, so a press dims the list while the answer is on its way (the
     rule lives in `assets/css/app.css`). --%>
-    <.card :if={@posts_total > 0 or @as_owner?} id="profile-posts" data-filter-scope>
+    <%!-- `flush`: below md this card runs the way the feed's timeline does —
+    the hairline between two posts reaches both edges and a lone picture breaks
+    out to them — so a post reads the same on a profile as in the feed. The
+    pinned post above the list becomes a full-width band there. --%>
+    <.card :if={@posts_total > 0 or @as_owner?} id="profile-posts" flush data-filter-scope>
       <%!-- A "profile" context disambiguates the noun (Beitrag/Beiträge) from the
       bare gettext("Post") verb on the composer's submit button ("Posten"), which
       shares the "Post" msgid and must not be repurposed. --%>
@@ -1017,10 +1026,12 @@ the resulting ~200px rail width. --%>
     <%!-- Follower / following previews (latest 3 each, full lists behind "View All").
     Side by side in two columns on sm+, stacked on mobile. `order-1` drops the
     pair below the rail's own cards on a phone (see the main column comment); at
-    md+ it sits at the foot of the main content column as before. --%>
+    md+ it sits at the foot of the main content column as before. No gap below
+    md: there the cards meet edge to edge like every other pair on the page
+    (`data-profile-edge`). --%>
     <div
       :if={@follower_count > 0 or @followee_count > 0}
-      class="order-1 grid gap-6 sm:grid-cols-2 md:order-none"
+      class="order-1 grid sm:grid-cols-2 md:order-none md:gap-6"
     >
       <.card :if={@follower_count > 0} id="profile-followers">
         <.section_title class="mb-4">{ngettext("Follower", "Followers", @follower_count)}</.section_title>
@@ -1131,7 +1142,12 @@ the resulting ~200px rail width. --%>
   <%!-- Right rail. `contents` on a phone (see the main column comment) so its
   cards join the single flex column and can interleave with the main column's;
   a real box again at md+. --%>
-  <aside class="contents md:block md:space-y-6">
+  <aside id="profile-rail" class="contents md:block md:space-y-6">
+    <%!-- The daily text ad leads the rail on a desktop. Hidden below md,
+    where the rail's cards join the one column and the copy under the header
+    stands in. --%>
+    <VutuvWeb.AdComponents.ad_slot ad={@ad_slot} placement={:rail} viewer={@current_user} />
+
     <%!-- Discovery leads the rail while the owner still follows fewer than
     five members (@promote_discovery?): a fresh account otherwise never learns
     that there are people here to follow. Above the threshold the card keeps
@@ -1545,74 +1561,39 @@ the resulting ~200px rail width. --%>
       </ul>
     </.card>
 
-    <.card :if={@totals.addresses > 0 or @as_owner?} id="profile-addresses">
+    <.card :if={@as_owner? or address_card?(@user.addresses)} id="profile-addresses">
       <.section_header title={ngettext("Address", "Addresses", @totals.addresses)} />
       <.empty_add :if={@as_owner? and @totals.addresses == 0} href={~p"/settings/addresses/new"}>
         {gettext("Add an address")}
       </.empty_add>
       <%!-- Icon block: a map-pin leads the entry; the description is the bold
-      title and the full address sits muted below it, tightened with
-      leading-snug. --%>
+      title and the full address sits muted below it. The whole block is the
+      one link to the viewer's map service (Vutuv.Maps.address_link/2, chosen
+      on /settings/preferences): the pin turns brand, an arrow says the link
+      leaves the site, and the row tints under the pointer. An address without
+      a city, or a viewer who turned maps off, gets the same block unlinked.
+      The geocoding query keeps the country even when it is hidden. --%>
       <ul class="-my-1.5 text-sm">
-        <li :for={address <- @user.addresses} class="flex items-start gap-2.5 py-1.5">
-          <.detail_icon name="map-pin" class="mt-0.5 h-4 w-4 shrink-0 text-slate-400 dark:text-slate-500" />
-          <div class="min-w-0 leading-snug">
-            <%!-- The label is optional (a welcome-page location may carry
-            none), so the title line drops out rather than leaving a gap. --%>
-            <p :if={address.description} class="mb-0 font-medium text-slate-800 dark:text-slate-100">
-              {address.description}
-            </p>
-            <div class="text-slate-600 dark:text-slate-400">
-              {format_address(address, @locale)}
-            </div>
-            <%!-- Open the address on a map. The viewer's default service
-            (Vutuv.Maps, set on their account settings or by clicking) is the one
-            decisive primary "Open in …" button; their other enabled services are
-            demoted to a quiet alternatives line so the row reads as a single map
-            action instead of look-alike links. A logged-in viewer's row carries
-            data-map-persist-url: the MapLinks enhancement in app.js then promotes
-            whichever alternative they open to their new default (live across all
-            rows, and persisted). The geocoding query keeps the country even when
-            it is hidden above. --%>
-            <% map = Vutuv.Maps.address_links(address, @current_user) %>
-            <div
-              :if={map.primary}
-              class="mt-1.5"
-              data-map-row
-              data-map-persist-url={@current_user && ~p"/maps/default"}
-            >
-              <.button
-                href={map.primary.url}
-                target="_blank"
-                rel="noopener noreferrer"
-                data-map-link
-                data-map-primary
-                data-service={map.primary.service}
-                data-label-primary={gettext("Open in %{name}", name: map.primary.label)}
-                data-label-alt={map.primary.label}
-              >
-                <.detail_icon name="map-pin" class="h-3.5 w-3.5" />
-                <span data-map-text>{gettext("Open in %{name}", name: map.primary.label)}</span>
-              </.button>
-              <div
-                :if={map.alternatives != []}
-                class="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-slate-600 dark:text-slate-400"
-              >
-                <span>{gettext("Also on")}</span>
-                <a
-                  :for={alt <- map.alternatives}
-                  data-map-link
-                  data-map-alt
-                  data-service={alt.service}
-                  data-label-primary={gettext("Open in %{name}", name: alt.label)}
-                  data-label-alt={alt.label}
-                  href={alt.url}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  class="font-medium text-brand-600 hover:text-brand-700 dark:text-brand-400 dark:hover:text-brand-300"
-                ><span data-map-text>{alt.label}</span></a>
-              </div>
-            </div>
+        <li :for={address <- @user.addresses}>
+          <% map = Vutuv.Maps.address_link(address, @current_user) %>
+          <.link
+            :if={map}
+            href={map.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            class="-mx-2 flex items-start gap-2.5 rounded-lg px-2 py-1.5 hover:bg-brand-50 dark:hover:bg-brand-800/30"
+          >
+            <.detail_icon name="map-pin" class="mt-0.5 h-4 w-4 shrink-0 text-brand-600 dark:text-brand-400" />
+            <.address_text address={address} locale={@locale} />
+            <.detail_icon
+              name="arrow-up-right"
+              class="mt-0.5 ml-auto h-4 w-4 shrink-0 text-brand-600 dark:text-brand-400"
+            />
+            <span class="sr-only">{gettext("Open in %{name}", name: map.label)}</span>
+          </.link>
+          <div :if={!map} class="flex items-start gap-2.5 py-1.5">
+            <.detail_icon name="map-pin" class="mt-0.5 h-4 w-4 shrink-0 text-slate-400 dark:text-slate-500" />
+            <.address_text address={address} locale={@locale} />
           </div>
         </li>
       </ul>
@@ -1682,7 +1663,7 @@ each CV category now, so @education holds every row. --%>
       educations: Enum.flat_map(@education_groups, & &1.entries),
       languages: @languages,
       qualifications: @qualifications,
-      addresses: @user.addresses,
+      addresses: if(address_card?(@user.addresses), do: @user.addresses, else: []),
       urls: @user.urls
     })
   }

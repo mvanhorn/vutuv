@@ -64,7 +64,6 @@ defmodule Vutuv.Mentions do
   alias Ecto.Changeset
   alias Vutuv.Accounts
   alias Vutuv.Accounts.User
-  alias Vutuv.Ads.Ad
   alias Vutuv.Chat.Message
   alias Vutuv.Fediverse
   alias Vutuv.Handles
@@ -159,8 +158,7 @@ defmodule Vutuv.Mentions do
     {User, :headline},
     {WorkExperience, :description},
     {Education, :description},
-    {JobPosting, :description},
-    {Ad, :content}
+    {JobPosting, :description}
   ]
 
   # How many distinct local accounts one post may name. Each mention is a
@@ -176,7 +174,7 @@ defmodule Vutuv.Mentions do
   # more letter is faster than reading.
   @suggest_limit 8
 
-  # The shortest term the picker answers for, matching `Posts.search_users/3`.
+  # The shortest term the picker answers for, matching `Accounts.search_people/3`.
   @suggest_min_chars 2
 
   # How many handles one `check_handles/1` call answers about. The composer asks
@@ -521,7 +519,7 @@ defmodule Vutuv.Mentions do
   nobody — `mentioned_users/2` excludes the author).
 
   Answers nothing below `#{@suggest_min_chars}` characters, the floor its
-  sibling typeahead `Vutuv.Posts.search_users/3` already uses: a bare `@` starts
+  sibling typeahead `Vutuv.Accounts.search_people/3` already uses: a bare `@` starts
   a word far more often than a mention, and one letter names half the site — so
   the rows would be noise, and each of them costs a scan on every keystroke.
   """
@@ -619,7 +617,7 @@ defmodule Vutuv.Mentions do
   @suggest_pool 24
 
   defp suggest_users(%User{id: viewer_id}, term, blocked) do
-    pattern = prefix(term)
+    pattern = SearchText.starts_with(term)
 
     from(u in User,
       select: struct(u, ^User.listing_fields()),
@@ -641,7 +639,7 @@ defmodule Vutuv.Mentions do
   end
 
   defp suggest_organizations(term) do
-    pattern = prefix(term)
+    pattern = SearchText.starts_with(term)
 
     from(o in Organization,
       # Exactly what a picker row draws (`VutuvWeb.MentionController.payload/1`):
@@ -658,8 +656,6 @@ defmodule Vutuv.Mentions do
     )
     |> Repo.all()
   end
-
-  defp prefix(term), do: SearchText.escape_like(term) <> "%"
 
   # A stable partition, so each group keeps the order the queries gave it.
   defp rank_suggestions(candidates, viewer) do
@@ -1081,7 +1077,6 @@ defmodule Vutuv.Mentions do
   defp surface_key(WorkExperience), do: :work_experiences
   defp surface_key(Education), do: :educations
   defp surface_key(JobPosting), do: :job_postings
-  defp surface_key(Ad), do: :ads
 
   defp normalize(value) when is_binary(value), do: Handles.normalize(value)
 

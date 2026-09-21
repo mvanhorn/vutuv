@@ -325,14 +325,12 @@ defmodule Vutuv.Accounts.User do
     # the registry). Never read these raw at a render site; resolve through
     # Vutuv.Prefs.get/2 (or the post_prefs/1 / Vutuv.Maps seams below).
     #
-    # The viewer's map preferences (language & display settings page, applied to
-    # every address this member looks at): which map services to show and which
-    # one is the default rendered as the primary "Open in …" button. Shipped
-    # defaults mean "all three on, Google the default". `Vutuv.Maps` owns the
-    # resolution and never trusts these to be consistent.
-    field(:map_google?, :boolean)
-    field(:map_openstreetmap?, :boolean)
-    field(:map_apple?, :boolean)
+    # The viewer's map service (language & display settings page, applied to
+    # every address this member looks at): which service an address links to,
+    # or "none". `Vutuv.Maps` owns the resolution. The three per-service
+    # switches that sat beside it were folded into this one value
+    # (`fold_map_services_into_one_choice`); their columns go in a later
+    # deploy.
     field(:default_map_service, :string)
     # The feed language preference (issue #1461): what happens to feed posts
     # outside `feed_languages` — "original" / "translate" / "hide"; nil
@@ -484,6 +482,12 @@ defmodule Vutuv.Accounts.User do
     # auto-hides an hour after sign-up). Set programmatically by
     # Vutuv.Accounts.dismiss_onboarding/1; never cast from a profile form.
     field(:onboarding_dismissed?, :boolean, default: false)
+    # The text-ad frequency rules, per member rather than per browser: when
+    # they last saw an ad (house ad included) and the Berlin day they closed
+    # one with its ✕. Written by Vutuv.Ads.record_sighting/3 and
+    # Vutuv.Ads.dismiss_today/1; never cast.
+    field(:ad_seen_at, :utc_datetime)
+    field(:ads_dismissed_on, :date)
     # When the member left the one-time welcome page (/system/welcome) behind —
     # by saving it or by skipping it. nil means "never seen", and that is the
     # ONLY gate: the post-registration redirect sends a member there while it is
@@ -602,7 +606,7 @@ defmodule Vutuv.Accounts.User do
   # :email_confirmed? is NOT here either: it flips only via the login-PIN path
   # (Accounts.activate_user/1, its own narrow cast) — castable, it would let a
   # registration self-activate without ever proving control of an email.
-  @optional_fields ~w(noindex? noai? notification_emails? dm_email_each_message? dm_email_delay_minutes email_on_endorsement? email_on_follower? email_on_reference_check? newsletter_emails? saved_search_emails? cv_update_notifications? thread_notifications? browser_notifications? show_online_status? show_mastodon_feed? mastodon_clients? show_code_stats? fediverse_followers? fediverse_reactions? fediverse_replies? also_known_as_input map_google? map_openstreetmap? map_apple? default_map_service post_lines_desktop post_lines_mobile post_hyphenate_desktop post_hyphenate_mobile notification_post_lines like_attribution? headline employment_status employment_status_visibility desired_salary_min desired_salary_currency desired_salary_period desired_salary_visibility desired_workplace_types first_name last_name middle_name nickname honorific_prefix honorific_suffix name_pronunciation gender birthdate birthdate_visibility locale date_region time_zone tag_list auto_post_deletion? auto_post_deletion_after_days auto_post_deletion_keep_photos? auto_post_deletion_keep_answered? auto_post_deletion_keep_bookmarked? auto_post_deletion_delete_replies? auto_post_deletion_min_likes auto_post_deletion_min_bookmarks auto_post_deletion_min_reposts feed_foreign_posts feed_languages feed_tab_ticker? feed_tab_ticker_seconds feed_page_size browser_tab_teaser? low_bandwidth?)a
+  @optional_fields ~w(noindex? noai? notification_emails? dm_email_each_message? dm_email_delay_minutes email_on_endorsement? email_on_follower? email_on_reference_check? newsletter_emails? saved_search_emails? cv_update_notifications? thread_notifications? browser_notifications? show_online_status? show_mastodon_feed? mastodon_clients? show_code_stats? fediverse_followers? fediverse_reactions? fediverse_replies? also_known_as_input default_map_service post_lines_desktop post_lines_mobile post_hyphenate_desktop post_hyphenate_mobile notification_post_lines like_attribution? headline employment_status employment_status_visibility desired_salary_min desired_salary_currency desired_salary_period desired_salary_visibility desired_workplace_types first_name last_name middle_name nickname honorific_prefix honorific_suffix name_pronunciation gender birthdate birthdate_visibility locale date_region time_zone tag_list auto_post_deletion? auto_post_deletion_after_days auto_post_deletion_keep_photos? auto_post_deletion_keep_answered? auto_post_deletion_keep_bookmarked? auto_post_deletion_delete_replies? auto_post_deletion_min_likes auto_post_deletion_min_bookmarks auto_post_deletion_min_reposts feed_foreign_posts feed_languages feed_tab_ticker? feed_tab_ticker_seconds feed_page_size browser_tab_teaser? low_bandwidth?)a
 
   # The ages the automatic post deletion offers (issue #1255), in days. A fixed
   # list rather than a free number field on purpose: this setting deletes
@@ -821,10 +825,7 @@ defmodule Vutuv.Accounts.User do
         do: [],
         else: [time_zone: "is not a known time zone"]
     end)
-    # The literal mirrors the canonical service list in `Vutuv.Maps`; it is kept
-    # inline (not `Maps.service_strings/0`) to avoid a compile cycle, since Maps
-    # pattern-matches the `User` struct.
-    |> validate_inclusion(:default_map_service, ~w(google openstreetmap apple))
+    |> validate_inclusion(:default_map_service, Prefs.pref!(:default_map_service).values)
     # The feed's foreign-language mode (issue #1461); a tampered value must
     # not fail the whole preferences form, so unknown values are refused with
     # a field error like the map service above.
@@ -1101,7 +1102,15 @@ defmodule Vutuv.Accounts.User do
       # costs five.
       add_error(changeset, :emails, @one_email_message)
     else
-      cast_assoc(changeset, :emails)
+      # `required: true`, because the address is not an optional detail of a
+      # sign-up: it is where the login PIN goes, so an account created without
+      # one can never be signed into by anybody. A bare `cast_assoc/2` accepted
+      # a POST that spelled the address under any other key and minted exactly
+      # that account, and `POST /new_registration` is unauthenticated, so the
+      # shape is somebody else's to send. The ordinary empty-field submit is
+      # unaffected: it posts `emails[0][value]` as "", which casts and then
+      # fails the Email changeset on the field itself.
+      cast_assoc(changeset, :emails, required: true)
     end
   end
 

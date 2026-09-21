@@ -31,7 +31,9 @@ defmodule VutuvWeb.UserControllerTest do
 
   test "renders form for new resources", %{conn: conn} do
     conn = get(conn, ~p"/")
-    assert html_response(conn, 200) =~ "Sign up"
+    # The first of the three sign-up steps. Its button reads "Continue"; the
+    # one that says "Sign up" ends step 3.
+    assert html_response(conn, 200) =~ "Create your free account"
   end
 
   test "does not create resource and renders errors when data is invalid", %{conn: conn} do
@@ -141,26 +143,6 @@ defmodule VutuvWeb.UserControllerTest do
     assert html_response(conn, 200) =~ user.first_name
   end
 
-  test "profile shows how long the account has been a member", %{conn: conn} do
-    # Older account: just the year (the join month adds nothing once a profile
-    # is a few years old).
-    user = insert_activated_user(inserted_at: ~N[2008-02-15 10:00:00])
-
-    html = conn |> get(~p"/#{user}") |> html_response(200)
-    assert html =~ "Member since 2008"
-    refute html =~ "Member since February 2008"
-  end
-
-  test "profile spells out the join month for accounts created this year", %{conn: conn} do
-    today = Date.utc_today()
-    inserted_at = NaiveDateTime.new!(today.year, today.month, 1, 12, 0, 0)
-    user = insert_activated_user(inserted_at: inserted_at)
-
-    html = conn |> get(~p"/#{user}") |> html_response(200)
-    month = Calendar.strftime(today, "%B")
-    assert html =~ "Member since #{month} #{today.year}"
-  end
-
   test "profile hides a zero follower/following counter", %{conn: conn} do
     # One follower, nobody followed back: the followers counter shows, the
     # following counter is gone (a bare "0 following" says nothing).
@@ -178,9 +160,10 @@ defmodule VutuvWeb.UserControllerTest do
     # rather than owning a line above it. That only works if the row cannot
     # wrap and the LABELS give way instead — with the longest German word
     # ("Vernetzungen") spent first, or a 374px phone loses "31 folgt" to an
-    # ellipsis before it loses anything worth saving. The lopsided shrink pair
-    # is what expresses that, and it is exactly the kind of oddity a later
-    # cleanup pass removes as noise, so it is pinned here.
+    # ellipsis before it loses anything worth saving. The lopsided shrink
+    # weights are what express that, and they are exactly the kind of oddity a
+    # later cleanup pass removes as noise, so they are pinned here (and in
+    # `profile_edge_to_edge_test.exs`, which says why the smallest is a 1).
     {conn, viewer} = create_and_login_user(conn)
     profile = insert_activated_user()
     # A mutual follow with the viewer: all three counters render (the
@@ -191,34 +174,32 @@ defmodule VutuvWeb.UserControllerTest do
 
     html = conn |> get(~p"/#{profile}") |> html_response(200)
 
-    assert [row] =
-             Regex.run(
-               ~r/<div id="profile-counts".*?<\/div>\s*<div class="mt-4 flex items-center gap-1 border-t/s,
-               html
-             )
+    assert [row] = elements(html, "#profile-counts")
+    row = LazyHTML.to_html(row)
 
     refute row =~ "flex-wrap"
+    assert row =~ "shrink-[10000]"
     assert row =~ "shrink-[100]"
-    assert row =~ "shrink-[0.01]"
     assert row =~ "truncate"
-    # the chip closes the row, after the counters
+    # the chip follows the counters, and the save glyphs close the row
     assert row =~ "data-profile-relationship"
     {follower_at, _} = :binary.match(row, ~p"/#{profile}/followers")
     {chip_at, _} = :binary.match(row, "data-profile-relationship")
+    {like_at, _} = :binary.match(row, ~s(id="profile-like"))
     assert follower_at < chip_at
+    assert chip_at < like_at
   end
 
-  test "with no followers or following, the counts row is gone but Member since still shows",
+  test "with no followers or following, the counts line still carries the vCard link",
        %{conn: conn} do
-    # "Member since" always anchors the footer row (left of the vCard action),
-    # whether or not there is a counts row above it.
-    user = insert_activated_user(inserted_at: ~N[2008-02-15 10:00:00])
+    # The line always renders, because the vCard at its end is universal.
+    user = insert_activated_user()
 
     html = conn |> get(~p"/#{user}") |> html_response(200)
 
     refute html =~ ~p"/#{user}/followers"
     refute html =~ ~p"/#{user}/following"
-    assert html =~ "Member since 2008"
+    assert [_] = elements(html, ~s(#profile-counts a[href="/#{user.username}.vcf"]))
   end
 
   test "profile uses the content+rail columns from tablet widths up", %{conn: conn} do
@@ -299,7 +280,7 @@ defmodule VutuvWeb.UserControllerTest do
 
     # General info (birthday in the en format, and the derived age)
     assert html =~ ~s(id="profile-about")
-    assert html =~ "04/15/1990"
+    assert html =~ "15/04/1990"
     assert html =~ "#{VutuvWeb.UserHelpers.age(user)} years old"
 
     # The gender answer is kept for the membership statistic and never reaches
@@ -569,8 +550,7 @@ defmodule VutuvWeb.UserControllerTest do
     end
   end
 
-  test "hides the country of a German address from a de viewer and links to maps",
-       %{conn: conn} do
+  test "links the whole address to Google Maps for a logged-out de viewer", %{conn: conn} do
     user = insert_activated_user()
 
     insert(:address,
@@ -592,23 +572,18 @@ defmodule VutuvWeb.UserControllerTest do
     # A German viewer looking at a German address does not need "Deutschland".
     refute html =~ "Deutschland"
 
-    # Every address links out to the major map services.
-    assert html =~ "https://www.google.com/maps/search/"
-    assert html =~ "https://www.openstreetmap.org/search"
-    assert html =~ "https://maps.apple.com/"
-    # For a logged-out viewer the default (Google Maps) is the single primary
-    # call to action; the other services are demoted to a quiet "also on" line
-    # so the row reads as one map action (Vutuv.Maps).
-    assert html =~ "In Google Maps öffnen"
-    assert html =~ "Auch auf"
-    assert html =~ "OpenStreetMap"
-    assert html =~ "Apple Maps"
-    # A logged-out viewer cannot promote a default, so the row carries no
-    # persist hook (the click-to-promote enhancement stays off).
-    refute html =~ "data-map-persist-url"
+    # The address itself is the one link, to the viewer's map service (Google
+    # for a logged-out viewer); the other providers are not offered here.
+    link = "#profile-addresses a[href^='https://www.google.com/maps/search/']"
+    assert text_of(html, link) =~ "Johannes-Müller-Str. 10"
+    assert text_of(html, link) =~ "In Google Maps öffnen"
+    assert [_] = Regex.scan(~r{https://www\.google\.com/maps/search/}, html)
+    refute html =~ "openstreetmap.org"
+    refute html =~ "maps.apple.com"
+    refute html =~ "Auch auf"
   end
 
-  test "renders the viewer's chosen default map service as the primary button", %{conn: conn} do
+  test "links the address to the viewer's chosen map service", %{conn: conn} do
     {conn, viewer} = create_and_login_user(conn)
     {:ok, _} = Vutuv.Accounts.update_user(viewer, %{"default_map_service" => "apple"})
 
@@ -617,35 +592,28 @@ defmodule VutuvWeb.UserControllerTest do
 
     html = conn |> get(~p"/#{owner}") |> html_response(200)
 
-    # The viewer defaulted to Apple Maps, so that is the primary "Open in …"
-    # button; the row carries the persist hook so a click promotes a new default.
+    assert text_of(html, "#profile-addresses a[href^='https://maps.apple.com/']") =~ "Koblenz"
     assert html =~ "Open in Apple Maps"
-    assert html =~ "data-map-persist-url"
-    assert html =~ ~s(data-service="apple")
+    refute html =~ "google.com/maps"
   end
 
-  test "shows no map buttons when the viewer has disabled every map service", %{conn: conn} do
+  test "shows the address without a link when the viewer has turned maps off", %{conn: conn} do
     {conn, viewer} = create_and_login_user(conn)
 
-    {:ok, _} =
-      Vutuv.Accounts.update_user(viewer, %{
-        "map_google?" => "false",
-        "map_openstreetmap?" => "false",
-        "map_apple?" => "false"
-      })
+    {:ok, _} = Vutuv.Accounts.update_user(viewer, %{"default_map_service" => "none"})
 
     owner = insert_activated_user()
     insert(:address, user: owner, description: "Office", city: "Koblenz", country: "Germany")
 
     html = conn |> get(~p"/#{owner}") |> html_response(200)
 
-    # The address itself still shows; only the map links are gone.
-    assert html =~ "Koblenz"
-    refute html =~ "https://maps.apple.com/"
-    refute html =~ "data-map-row"
+    assert text_of(html, "#profile-addresses") =~ "Koblenz"
+    refute html =~ "google.com/maps"
+    refute html =~ "maps.apple.com"
+    refute html =~ "openstreetmap.org"
   end
 
-  test "keeps the country line of a German address for a non-de viewer", %{conn: conn} do
+  test "names the country of a German address in an en viewer's language", %{conn: conn} do
     user = insert_activated_user()
     insert(:address, user: user, description: "Office", city: "Koblenz", country: "Germany")
 
@@ -655,8 +623,55 @@ defmodule VutuvWeb.UserControllerTest do
       |> get(~p"/#{user}")
       |> html_response(200)
 
-    assert html =~ "Koblenz"
-    assert html =~ "Deutschland"
+    # The JSON-LD carries the stored English name too, so read the card alone.
+    card = text_of(html, "#profile-addresses")
+    assert card =~ "Koblenz"
+    assert card =~ "Germany"
+    refute html =~ "Deutschland"
+  end
+
+  test "names a foreign country in a de viewer's language", %{conn: conn} do
+    user = insert_activated_user()
+    insert(:address, user: user, description: "Büro", city: "Paris", country: "France")
+
+    html =
+      conn
+      |> put_req_header("accept-language", "de-DE,de")
+      |> get(~p"/#{user}")
+      |> html_response(200)
+
+    assert html =~ "Frankreich"
+  end
+
+  test "hides the address card from visitors while no address names a city", %{conn: conn} do
+    owner = insert_activated_user()
+    insert(:address, user: owner, description: "Private", city: nil, zip_code: nil)
+
+    html = conn |> get(~p"/#{owner}") |> html_response(200)
+
+    refute html =~ ~s(id="profile-addresses")
+    refute html =~ "PostalAddress"
+  end
+
+  test "the owner still sees an address card without a city, but no map", %{conn: conn} do
+    {conn, owner} = create_and_login_user(conn)
+    insert(:address, user: owner, description: "Private", city: nil, zip_code: nil)
+
+    html = conn |> get(~p"/#{owner}") |> html_response(200)
+
+    assert html =~ ~s(id="profile-addresses")
+    refute html =~ "google.com/maps"
+  end
+
+  test "maps only the addresses that name a city", %{conn: conn} do
+    owner = insert_activated_user()
+    insert(:address, user: owner, description: "Office", city: "Koblenz", country: "Germany")
+    insert(:address, user: owner, description: "Private", city: nil, zip_code: nil)
+
+    html = conn |> get(~p"/#{owner}") |> html_response(200)
+
+    assert html =~ ~s(id="profile-addresses")
+    assert [_] = Regex.scan(~r{https://www\.google\.com/maps/search/}, html)
   end
 
   test "a member the owner follows does not see the owner's private email (page still renders)",
@@ -1336,10 +1351,11 @@ defmodule VutuvWeb.UserControllerTest do
       html = conn |> get(~p"/#{other}") |> html_response(200)
 
       refute html =~ "data-profile-relationship"
-      # Nobody follows this member and this member follows nobody, so with no
-      # chip either the row that would hold them is left out entirely rather
-      # than shipping an empty `mt-4` div above the footer.
-      refute html =~ ~s(id="profile-counts")
+      # Nobody follows this member and this member follows nobody, so the line
+      # holds no counter and no chip, only the save glyphs it always carries.
+      assert [] = elements(html, "#profile-counts a[href$=\"/followers\"]")
+      assert [] = elements(html, "#profile-counts a[href$=\"/following\"]")
+      assert [_] = elements(html, "#profile-counts #download-vcard")
       # the toggle offers a follow (a phx-click create-follow targeting other)
       assert html =~ ~s(phx-click="follow")
       assert html =~ ~s(phx-value-followee="#{other.id}")

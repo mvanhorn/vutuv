@@ -45,11 +45,10 @@ defmodule VutuvWeb.Router do
     # square picture (VutuvWeb.OpenGraph).
     plug(Plugs.PreviewScraper)
     # The one-time welcome questions, floating over the page a brand-new
-    # member's registration PIN landed them on. Before the ad plug, which
-    # stands down while they are open.
+    # member's registration PIN landed them on. The daily text ad
+    # (VutuvWeb.AdServing, asked by the profile and the feed) stands down
+    # while they are open.
     plug(Plugs.WelcomeModal)
-    # The daily text ad between navigation and content (1/hour per session).
-    plug(Plugs.AdBanner)
   end
 
   # Pages that are routable but must not be indexed, without the rest of a
@@ -58,6 +57,12 @@ defmodule VutuvWeb.Router do
   # a bare link.
   pipeline :noindex_pipe do
     plug(Plugs.NoIndex)
+  end
+
+  # The daily text-ad pages that are not the /system/ads controller, which gates
+  # itself: they 404 while the system is off.
+  pipeline :ads_enabled do
+    plug(Plugs.RequireAdsEnabled)
   end
 
   # Routed LiveViews (the two `live_session` blocks below). A LiveView has one
@@ -136,8 +141,8 @@ defmodule VutuvWeb.Router do
     plug(Plugs.AuthAdmin)
   end
 
-  # Like :browser, but deliberately WITHOUT CSRF protection and without the
-  # ad banner: the RFC 8058 one-click unsubscribe POST comes from the mail
+  # Like :browser, but deliberately WITHOUT CSRF protection: the RFC 8058
+  # one-click unsubscribe POST comes from the mail
   # provider with no cookies and no token. The signed token in the URL is the
   # authorization, and the action only ever switches notification mail off.
   pipeline :unsubscribe do
@@ -896,12 +901,6 @@ defmodule VutuvWeb.Router do
     post("/user_likes", UserSaveController, :like)
     delete("/user_likes/:id", UserSaveController, :unlike)
 
-    # Promote a map service to the viewer's default (the primary "Open in …"
-    # button on address cards). Fired by the MapLinks enhancement in app.js when
-    # a logged-in member opens a non-default service. Logged-in only. See
-    # VutuvWeb.MapPreferenceController.
-    post("/maps/default", MapPreferenceController, :update)
-
     # Vernetzt = a mutual follow, so there is no connection lifecycle any more:
     # you just follow (above), and a follow-back makes you vernetzt. The list
     # lives at /:slug/connections in the profile scope below (read-only).
@@ -1056,15 +1055,16 @@ defmodule VutuvWeb.Router do
     # The daily text ad: the public offer page, the booking flow and the
     # member's booking dashboard (logged-in only; checked in the
     # controller). See Vutuv.Ads; admin approval lives under /admin/ads.
-    get("/ads", AdController, :index)
-    get("/ads/new", AdController, :new)
-    # POST /ads/new is the "edit again" leg of the preview step: it re-renders
-    # the form with the submitted values; /ads/preview shows the ad as the
-    # banner will render it before the binding POST /ads books it.
-    post("/ads/new", AdController, :new)
-    post("/ads/preview", AdController, :preview)
-    get("/ads/bookings", AdController, :bookings)
-    post("/ads", AdController, :create)
+    # Under /system/ like every site page, so no handle is burnt for it.
+    get("/system/ads", AdController, :index)
+    # Booking itself is the wizard `VutuvWeb.AdBookingLive` (live route in the
+    # live_session below): the ad is drawn as it is typed and the calendar works
+    # in the block being bought, neither of which a dead form can do.
+    get("/system/ads/bookings", AdController, :bookings)
+    # The booker withdraws a booking that still waits for approval (free), or
+    # takes an approved one off the site (no money back).
+    post("/system/ads/:id/cancel", AdController, :cancel)
+    post("/system/ads/:id/withdraw", AdController, :withdraw)
 
     # Blocking: the profile-footer Block control, the private blocked list,
     # and unblocking. Logged-in only ("blocks" is in ReservedSlugs).
@@ -1178,6 +1178,11 @@ defmodule VutuvWeb.Router do
       # reusing `/with/:slug`: a page's slug and a member's handle are
       # different namespaces, so one path could name both.
       live("/messages/organization/:slug", MessageLive.Index, :new_organization)
+      # And for an account on another network, keyed by the stored row's id
+      # rather than by an address: a path taking an address would be an
+      # open-ended "go and fetch this" surface, the same call the account page
+      # makes (`FediverseAccountLive`).
+      live("/messages/fediverse/:id", MessageLive.Index, :new_fediverse)
       live("/messages/:id", MessageLive.Index, :show)
 
       # The post editor ("posts" is a ReservedSlug). Auth is checked in the
@@ -1223,6 +1228,16 @@ defmodule VutuvWeb.Router do
         # (`Vutuv.PersonalNotes`): every one of them, searchable, or those about
         # one account when a profile's panel or a handle's card links here.
         live("/notes", PersonalNotesLive, :index)
+      end
+
+      # The ads a member was shown, the page the card's "Ad" label leads to.
+      # Private and one member's own, so noindex like the uploads queue.
+      scope "/system/ads" do
+        pipe_through([:noindex_pipe, :ads_enabled])
+        live("/seen", AdsSeenLive, :index)
+
+        # The three-step booking wizard. Login is checked in the mount.
+        live("/new", AdBookingLive, :new)
       end
 
       # Job postings ("jobs" is a ReservedSlug). Auth is checked in the mounts.
@@ -1344,8 +1359,14 @@ defmodule VutuvWeb.Router do
     # The ad review dashboard: every booked ad is approved here before it
     # serves (see Vutuv.Ads.approve_ad/2). :show is the per-ad detail page.
     get("/ads", AdController, :index)
+    # Discount codes, before /ads/:id so "discounts" is never taken for an id.
+    get("/ads/discounts", DiscountCodeController, :index)
+    post("/ads/discounts", DiscountCodeController, :create)
+    delete("/ads/discounts/:id", DiscountCodeController, :delete)
     get("/ads/:id", AdController, :show)
     post("/ads/:id/approve", AdController, :approve)
+    post("/ads/:id/reject", AdController, :reject)
+    post("/ads/:id/cancel", AdController, :cancel)
 
     # Force-rename a member out of an unwanted username (the old name is not
     # blocked afterwards). GET renders the form; POST does the rename.

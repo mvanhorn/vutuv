@@ -5,7 +5,7 @@ defmodule VutuvWeb.AdsDisabledTest do
 
   The test environment runs with ads **on** (so every ad test exercises the
   real flow), so each test here flips the flag **off** for its duration and
-  asserts the system goes dormant: no banner serves, the public `/ads` flow
+  asserts the system goes dormant: no banner serves, the public `/system/ads` flow
   and the admin review dashboard 404, and nothing can be booked - while
   `"ads"` stays a reserved slug so the handle is never claimed in the
   meantime.
@@ -30,28 +30,35 @@ defmodule VutuvWeb.AdsDisabledTest do
     assert Ads.enabled?()
   end
 
-  test "no ad banner is served on any page", %{conn: conn} do
+  test "no ad is served, not even on the pages that carry one", %{conn: conn} do
     # A booked, approved ad for today would normally serve; with the switch
-    # off it does not.
-    insert(:ad, day: Ads.today(), content: "**Acme** sucht Leute")
+    # off it does not. The member is aged past the two-week grace period, or
+    # that rule alone would keep the card away and this would pass either way.
+    insert(:ad, day: Ads.today(), title: "Acme sucht Leute")
+    {conn, user} = create_and_login_user(conn)
+    backdate_registration!(user, Ads.grace_days() + 1)
 
-    html = conn |> get(~p"/community") |> html_response(200)
-
-    refute html =~ ~s(id="vutuv-ad")
-    refute html =~ "data-ad-banner"
+    refute conn |> get(~p"/feed") |> html_response(200) =~ "ad-slot"
+    refute conn |> get(~p"/#{user}") |> html_response(200) =~ "ad-slot"
   end
 
-  test "the public /ads pages 404 in every format", %{conn: conn} do
-    assert conn |> get(~p"/ads") |> html_response(404)
-    assert get(build_conn(), "/ads.md").status == 404
-    assert get(build_conn(), "/ads.json").status == 404
+  test "the seen-ads page does not exist", %{conn: conn} do
+    {conn, _user} = create_and_login_user(conn)
+
+    assert conn |> get("/system/ads/seen") |> html_response(404)
+  end
+
+  test "the public /system/ads pages 404 in every format", %{conn: conn} do
+    assert conn |> get(~p"/system/ads") |> html_response(404)
+    assert get(build_conn(), "/system/ads.md").status == 404
+    assert get(build_conn(), "/system/ads.json").status == 404
   end
 
   test "the public booking flow 404s for a logged-in member", %{conn: conn} do
     {conn, _user} = create_and_login_user(conn)
 
-    assert conn |> get(~p"/ads/new") |> html_response(404)
-    assert conn |> get(~p"/ads/bookings") |> html_response(404)
+    assert conn |> get(~p"/system/ads/new") |> html_response(404)
+    assert conn |> get(~p"/system/ads/bookings") |> html_response(404)
   end
 
   test "the admin ad-review dashboard 404s for an admin", %{conn: conn} do

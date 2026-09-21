@@ -33,6 +33,7 @@ defmodule VutuvWeb.SettingsHTML do
   alias Vutuv.ContentFilters.ContentFilter
   alias Vutuv.Mutes
   alias Vutuv.Mutes.AccountMute
+  alias Vutuv.Prefs
   alias Vutuv.SavedSearches
 
   embed_templates("../templates/settings/*")
@@ -139,6 +140,16 @@ defmodule VutuvWeb.SettingsHTML do
 
   def organization_status_class(_organization),
     do: "bg-emerald-50 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-200"
+
+  @doc """
+  A select pref's values as `{label, value}` pairs, read off the `Vutuv.Prefs`
+  registry, so a member page and `/admin/preferences` offer and name the same
+  choices (`Vutuv.Prefs.value_label/2`).
+  """
+  def pref_options(key) do
+    pref = Prefs.pref!(key)
+    Enum.map(pref.values, &{Prefs.value_label(pref, &1), &1})
+  end
 
   @doc """
   The two choices for how often the unread-message email is sent, as

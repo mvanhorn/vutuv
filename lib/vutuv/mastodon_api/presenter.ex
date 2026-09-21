@@ -29,6 +29,15 @@ defmodule Vutuv.MastodonApi.Presenter do
   alias VutuvWeb.Markdown
   alias VutuvWeb.RemoteMediaToken
 
+  # Every member's `created_at`. The field is required and every app shows it
+  # as the day the account joined, and how long somebody has been a member is
+  # shown nowhere on vutuv (Stefan, 2026-09-18). Leaving it out or sending
+  # something unparseable is not an option: Ivory and Ice Cubes fail on a date
+  # they cannot read (see `timestamp/1`). So all members share one placeholder,
+  # printed through `timestamp/1` like every other time. A page keeps its real
+  # date.
+  @member_created_at ~U[1970-04-01 00:00:00Z]
+
   def identity_name(%User{} = user),
     do: Identity.display_name(user) <> " (@" <> user.username <> ")"
 
@@ -59,7 +68,7 @@ defmodule Vutuv.MastodonApi.Presenter do
       acct: user.username,
       display_name: Identity.display_name(user),
       note: note(user.headline),
-      created_at: created_at(user, user.id),
+      created_at: timestamp(@member_created_at),
       url: profile_url(user),
       avatar: avatar,
       header: header,
@@ -508,12 +517,9 @@ defmodule Vutuv.MastodonApi.Presenter do
   end
 
   # Mastodon's `note` is HTML, and a vutuv headline or page description is
-  # plain text a member typed. Escaped and wrapped in one paragraph, so a
-  # client renders the words rather than parsing whatever was in them.
-  defp note(text) when is_binary(text) and text != "",
-    do: "<p>" <> Plug.HTML.html_escape(text) <> "</p>"
-
-  defp note(_blank), do: ""
+  # Markdown: rendered the way the profile renders it (raw HTML a member typed
+  # stays escaped text), so an app shows a link rather than its syntax.
+  defp note(text), do: Markdown.render_absolute(text, main_base())
 
   @doc """
   The picture stood in for an account we hold no avatar for — a page, a remote
@@ -1217,11 +1223,12 @@ defmodule Vutuv.MastodonApi.Presenter do
     |> DateTime.to_iso8601()
   end
 
-  # Not every caller hands over a fully loaded row: `Vutuv.Search` selects the
-  # few columns a result list needs, so `inserted_at` can be absent. Raising
-  # over a missing display timestamp would be the wrong trade, and there is a
-  # better answer than nil — the id is a UUIDv7 and carries its own creation
-  # time.
+  # Not every caller hands over a fully loaded row: a query that selects only
+  # the few columns a list needs leaves `inserted_at` out (search once did this
+  # for members, whose date is a fixed placeholder now). Raising over a missing
+  # display timestamp would be the wrong trade, and for a page there is a better
+  # answer than nil — its id is a UUIDv7 and carries its own creation time, which
+  # is what `created_at/2` falls back to.
   def timestamp(_missing), do: nil
 
   defp created_at(%{inserted_at: at}, _id) when not is_nil(at), do: timestamp(at)

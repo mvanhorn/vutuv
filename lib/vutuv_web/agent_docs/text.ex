@@ -358,7 +358,7 @@ defmodule VutuvWeb.AgentDocs.Text do
     |> join_blocks()
   end
 
-  # The /ads offer page (VutuvWeb.AgentDocs.AdsDoc).
+  # The /system/ads offer page (VutuvWeb.AgentDocs.AdsDoc).
   def render(%{type: "advertising"} = doc) do
     [
       heading(doc.title),
@@ -640,7 +640,6 @@ defmodule VutuvWeb.AgentDocs.Text do
       User.desired_workplace_line(doc.desired_workplace_types) &&
         "#{gettext("Preferred workplace")}: #{User.desired_workplace_line(doc.desired_workplace_types)}",
       doc.desired_salary && User.desired_salary_agent_line(doc.desired_salary),
-      "#{gettext("Member since")}: #{doc.member_since}",
       fediverse_fact(doc[:fediverse]),
       count_facts(doc.counts),
       birthday_facts(doc)

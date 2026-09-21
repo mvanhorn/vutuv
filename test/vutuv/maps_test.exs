@@ -14,45 +14,11 @@ defmodule Vutuv.MapsTest do
     })
   end
 
-  describe "the canonical service list" do
-    test "is Google, OpenStreetMap, Apple in display order" do
-      assert Maps.services() == [:google, :openstreetmap, :apple]
-      assert Maps.service_strings() == ["google", "openstreetmap", "apple"]
-    end
-
-    test "valid_service?/1 only accepts the known string forms" do
-      assert Maps.valid_service?("google")
-      assert Maps.valid_service?("apple")
-      refute Maps.valid_service?("bing")
-      refute Maps.valid_service?(:google)
-      refute Maps.valid_service?(nil)
-    end
-
+  describe "the service labels" do
     test "label/1 names each service" do
       assert Maps.label(:google) == "Google Maps"
       assert Maps.label(:openstreetmap) == "OpenStreetMap"
       assert Maps.label(:apple) == "Apple Maps"
-    end
-  end
-
-  describe "enabled_services/1" do
-    test "a logged-out viewer (nil) gets all three" do
-      assert Maps.enabled_services(nil) == [:google, :openstreetmap, :apple]
-    end
-
-    test "a member with every flag on gets all three, in canonical order" do
-      user = %User{map_google?: true, map_openstreetmap?: true, map_apple?: true}
-      assert Maps.enabled_services(user) == [:google, :openstreetmap, :apple]
-    end
-
-    test "a disabled service drops out" do
-      user = %User{map_google?: false, map_openstreetmap?: true, map_apple?: false}
-      assert Maps.enabled_services(user) == [:openstreetmap]
-    end
-
-    test "legacy nil flags read as on" do
-      user = %User{map_google?: nil, map_openstreetmap?: nil, map_apple?: nil}
-      assert Maps.enabled_services(user) == [:google, :openstreetmap, :apple]
     end
   end
 
@@ -61,73 +27,50 @@ defmodule Vutuv.MapsTest do
       assert Maps.default_service(nil) == :google
     end
 
-    test "honours the member's stored default when it is enabled" do
-      user = %User{map_apple?: true, default_map_service: "apple"}
-      assert Maps.default_service(user) == :apple
+    test "an untouched member inherits the installation default" do
+      assert Maps.default_service(%User{}) == :google
     end
 
-    test "falls back to the first enabled service when the default is disabled" do
-      # Default points at Google, but Google is off: the first enabled wins.
-      user = %User{
-        map_google?: false,
-        map_openstreetmap?: true,
-        map_apple?: true,
-        default_map_service: "google"
-      }
-
-      assert Maps.default_service(user) == :openstreetmap
+    test "honours the member's choice" do
+      assert Maps.default_service(%User{default_map_service: "apple"}) == :apple
     end
 
-    test "is nil when every service is disabled" do
-      user = %User{map_google?: false, map_openstreetmap?: false, map_apple?: false}
-      assert Maps.default_service(user) == nil
+    test "is nil when the member chose no map link" do
+      assert Maps.default_service(%User{default_map_service: "none"}) == nil
     end
   end
 
-  describe "address_links/2" do
-    test "a logged-out viewer sees Google primary, the rest as alternatives" do
-      %{primary: primary, alternatives: alts} = Maps.address_links(address(), nil)
+  describe "address_link/2" do
+    test "a logged-out viewer gets Google Maps" do
+      link = Maps.address_link(address(), nil)
 
-      assert primary.service == :google
-      assert primary.label == "Google Maps"
-      assert primary.url =~ "https://www.google.com/maps/search/"
-      assert Enum.map(alts, & &1.service) == [:openstreetmap, :apple]
+      assert link.service == :google
+      assert link.label == "Google Maps"
+      assert link.url =~ "https://www.google.com/maps/search/"
     end
 
-    test "the member's default becomes the primary; alternatives keep canonical order" do
-      user = %User{map_apple?: true, default_map_service: "apple"}
+    test "a member gets the service they chose" do
+      user = %User{default_map_service: "apple"}
 
-      %{primary: primary, alternatives: alts} = Maps.address_links(address(), user)
-
-      assert primary.service == :apple
-      assert primary.url =~ "https://maps.apple.com/"
-      assert Enum.map(alts, & &1.service) == [:google, :openstreetmap]
+      assert %{service: :apple, url: "https://maps.apple.com/" <> _} =
+               Maps.address_link(address(), user)
     end
 
-    test "a single enabled service renders just the primary, no alternatives" do
-      user = %User{
-        map_google?: false,
-        map_openstreetmap?: true,
-        map_apple?: false,
-        default_map_service: "openstreetmap"
-      }
-
-      assert %{primary: %{service: :openstreetmap}, alternatives: []} =
-               Maps.address_links(address(), user)
+    test "choosing no map link leaves the address unlinked" do
+      assert Maps.address_link(address(), %User{default_map_service: "none"}) == nil
     end
 
-    test "disabling every service hides the map entirely" do
-      user = %User{map_google?: false, map_openstreetmap?: false, map_apple?: false}
-      assert %{primary: nil, alternatives: []} = Maps.address_links(address(), user)
+    test "an address without a city gets no link, whatever the viewer enabled" do
+      country_only = struct(Address, %{country: "Germany", zip_code: "56068"})
+
+      assert Maps.address_link(country_only, nil) == nil
     end
 
-    test "every link's geocoding query still carries the address" do
-      %{primary: primary, alternatives: alts} = Maps.address_links(address(), nil)
+    test "the geocoding query carries the address" do
+      link = Maps.address_link(address(), nil)
 
-      for link <- [primary | alts] do
-        assert link.url =~ "Koblenz"
-        assert link.url =~ "Germany"
-      end
+      assert link.url =~ "Koblenz"
+      assert link.url =~ "Germany"
     end
   end
 end

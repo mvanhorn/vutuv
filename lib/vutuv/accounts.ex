@@ -6,7 +6,17 @@ defmodule Vutuv.Accounts do
 
   import Ecto.Query
   import Vutuv.Moderation.Query, only: [account_confirmed_row: 1, account_hidden_row: 1]
-  import Vutuv.SearchText, only: [contains: 1, name_ilike: 3, normalize_search: 1]
+
+  import Vutuv.SearchText,
+    only: [
+      contains: 1,
+      equals: 1,
+      name_ilike: 3,
+      normalize_search: 1,
+      person_ilike: 4,
+      starts_with: 1
+    ]
+
   require Logger
 
   # Enables the bare `gettext/1` macro for the PIN / status strings below.
@@ -90,7 +100,7 @@ defmodule Vutuv.Accounts do
         {:ok, user}
 
       # The insert failed on the user changeset (invalid input, email taken):
-      # return it unchanged so email_already_taken?/1 can still classify it.
+      # return it unchanged so taken_email/1 can still classify it.
       {:error, :user, changeset, _} ->
         {:error, changeset}
 
@@ -105,24 +115,37 @@ defmodule Vutuv.Accounts do
   end
 
   @doc """
-  Whether a failed `register_user/3` changeset failed *only* because the email
-  address is already registered (the emails unique constraint fired). The
-  sign-up controller masks exactly this case so the form can't leak whether an
-  address has an account; classifying it here keeps that security-relevant rule
-  next to the constraint that defines it rather than in the web layer.
+  The address a failed `register_user/3` collided on, or `nil` when it failed
+  for any other reason — i.e. the emails unique constraint fired. The sign-up
+  controller masks exactly this case so the form can't leak whether an address
+  has an account; classifying it here keeps that security-relevant rule next to
+  the constraint that defines it rather than in the web layer.
 
   `unique_constraint` only fires after the INSERT, which Ecto attempts only on
   an otherwise-valid changeset, so a genuine input error (bad format, missing
   name) never coincides with it.
+
+  It returns the **address** rather than a boolean because the caller's next act
+  is mailing that address a "somebody tried to register you" notice, and it used
+  to read the address back out of the params instead. Those two answers were not
+  the same answer: the params extraction matched `emails[0]` alone, while
+  `several_emails?/1` counts entries rather than keys, so a single address
+  posted as `emails[1]` was cast, collided, and then handed the notifier a nil
+  — `String.downcase/2` four frames down, on an unauthenticated endpoint, for
+  anyone who knew one member's address. One owner, and the notice now goes to
+  the address that really collided.
   """
-  def email_already_taken?(%Ecto.Changeset{} = changeset) do
+  def taken_email(%Ecto.Changeset{} = changeset) do
     changeset
     |> Ecto.Changeset.get_change(:emails, [])
-    |> Enum.any?(fn email_changeset ->
-      Enum.any?(email_changeset.errors, fn
-        {:value, {_message, opts}} -> Keyword.get(opts, :constraint) == :unique
-        _ -> false
-      end)
+    |> Enum.find_value(fn email_changeset ->
+      collided? =
+        Enum.any?(email_changeset.errors, fn
+          {:value, {_message, opts}} -> Keyword.get(opts, :constraint) == :unique
+          _ -> false
+        end)
+
+      collided? && Ecto.Changeset.get_field(email_changeset, :value)
     end)
   end
 
@@ -342,7 +365,8 @@ defmodule Vutuv.Accounts do
   belongs to an account; an attacker who guesses an unknown address gets
   the identical PIN screen but never receives a PIN.
   """
-  def login_by_email(conn, email, flow) when flow in [:login, :registration] do
+  def login_by_email(conn, email, flow)
+      when is_binary(email) and flow in [:login, :registration] do
     advance_to_pin_screen(conn, email, &send_login_pin/2, flow)
   end
 
@@ -373,7 +397,8 @@ defmodule Vutuv.Accounts do
   them someone tried to register and links them to the login page. No PIN is
   sent, so the notice carries nothing a non-owner could act on.
   """
-  def notify_registration_attempt(conn, email, pin_allowed?) when is_boolean(pin_allowed?) do
+  def notify_registration_attempt(conn, email, pin_allowed?)
+      when is_binary(email) and is_boolean(pin_allowed?) do
     notify = fn user, address ->
       if pin_allowed? and incomplete_registration?(user) do
         send_login_pin(user, address)
@@ -389,6 +414,13 @@ defmodule Vutuv.Accounts do
   # address up, hand a found account to `notify` (a login PIN, or the
   # registration-attempt notice), and advance to the PIN screen the same way
   # whether or not it was found — the response never depends on existence.
+  #
+  # Both doors above guard `is_binary(email)` rather than letting a nil reach
+  # the `String.downcase/1` below. It is the one argument here that is a
+  # credential destination, and a caller that does not know where the PIN goes
+  # has a bug: a nil used to raise four frames down, which read as a crash in
+  # `String`, and a nil made into a silent no-op would be worse still — the
+  # member would sit on a PIN screen waiting for a mail nobody ever sent.
   defp advance_to_pin_screen(conn, email, notify, flow) do
     email = String.downcase(email)
 
@@ -2396,24 +2428,6 @@ defmodule Vutuv.Accounts do
     end
   end
 
-  @doc """
-  Sets the viewer's default map service (the one rendered as the primary
-  "Open in …" button). `service` must be one of `Vutuv.Maps.service_strings/0`,
-  so the click-to-promote endpoint can never write an arbitrary value. A narrow
-  changeset, deliberately not `update_user/2`: this fires on every map click, so
-  it skips the image-store and search-term rebuild that the full path carries.
-  Returns `{:error, :invalid_service}` for anything else.
-  """
-  def set_default_map_service(%User{} = user, service) when is_binary(service) do
-    if Vutuv.Maps.valid_service?(service) do
-      user
-      |> Ecto.Changeset.change(%{default_map_service: service})
-      |> Repo.update()
-    else
-      {:error, :invalid_service}
-    end
-  end
-
   # ── Usernames ──
 
   @username_change_limit 4
@@ -2648,6 +2662,12 @@ defmodule Vutuv.Accounts do
   member with several addresses gets a deterministic primary recipient rather
   than whichever row Postgres happened to return.
   """
+  # A freshly registered account carries its one address already: `cast_assoc`
+  # writes the inserted child back onto the parent, so the sign-up path would
+  # otherwise spend a round trip asking for a row it is holding. One address
+  # needs no ordering, which is why this clause can answer without the query.
+  def first_email_value(%User{emails: [%Email{value: value}]}), do: value
+
   def first_email_value(%User{id: id}) do
     Repo.one(from(e in Email.ordered(), where: e.user_id == ^id, limit: 1, select: e.value))
   end
@@ -2789,6 +2809,101 @@ defmodule Vutuv.Accounts do
   defp filter_flag(query, "unreachable"), do: where(query, [u], not is_nil(u.unreachable_at))
   defp filter_flag(query, "spam"), do: where(query, [u], u.moderation_reason == "spam")
   defp filter_flag(query, _all), do: query
+
+  @doc """
+  Person typeahead: activated members matching `term`, `me` excluded, ordered
+  by name. Returns `[]` below two characters, so one keystroke never runs a
+  `%like%` over the whole table.
+
+  Matches a **first name, a last name, both in either order, or a handle** —
+  `SearchText.name_ilike/3` covers "Jan", "Petersen" and "Jan Petersen", and
+  the reversed pair is asked for separately because somebody looking for a
+  colleague types the name the way they hold it in their head, which in a
+  German office is as often "Petersen Jan".
+
+  **Ranked before it is cut**: an exact hit first, then one that starts with
+  the term, then one anywhere inside. The alphabet alone decides nothing about
+  how well a row matches, so a short term in a crowded name drops the row the
+  member was after: "witt" matched 13 members on vutuv.de, and Stephan Witt
+  (`witt_s`) — the exact hit on both his last name and his handle — sat at
+  position twelve of a list cut at six, behind "Dominico Klawitter".
+
+  Matching and ranking are the same expression (`SearchText.person_ilike/4`)
+  so a column added to one cannot go missing from the other.
+
+  It is the one person typeahead: the messages finder and the composer's
+  "Hide from…" sheet ask the same question, and finding a member by name is an
+  Accounts question wherever it is asked.
+
+  ## Options
+
+    * `:limit` — how many rows at most (default 8).
+    * `:include_self` — whether the viewer counts as a candidate (default
+      `false`). The two callers really do differ: hiding a post from yourself
+      is a no-op by invariant, so the composer's sheet must not offer you,
+      while the messages finder shows you and greys the row out — a search for
+      your own name that answers "nobody" reads as broken rather than as a
+      rule, which is what a member reported.
+  """
+  def search_people(%User{id: me_id}, term, opts \\ []) when is_binary(term) do
+    # A member writes a handle the way it is shown to them, with its @.
+    term = Handles.normalize(term)
+
+    if String.length(term) < 2 do
+      []
+    else
+      like = contains(term)
+      exact = equals(term)
+      prefix = starts_with(term)
+
+      from(u in User,
+        where: account_confirmed_row(u) and not account_hidden_row(u),
+        where: ^matches(like, reversed_name(term)),
+        order_by: [
+          asc:
+            fragment(
+              "case when ? then 0 when ? then 1 else 2 end",
+              person_ilike(u.first_name, u.last_name, u.username, ^exact),
+              person_ilike(u.first_name, u.last_name, u.username, ^prefix)
+            ),
+          asc: u.first_name,
+          asc: u.last_name
+        ],
+        limit: ^Keyword.get(opts, :limit, 8)
+      )
+      |> without_self(me_id, Keyword.get(opts, :include_self, false))
+      |> Repo.all()
+    end
+  end
+
+  defp without_self(query, _me_id, true), do: query
+  defp without_self(query, me_id, _include_self), do: where(query, [u], u.id != ^me_id)
+
+  # The match, as one expression rather than two `where`s: `or_where/3` would
+  # OR against everything accumulated before it, so a hidden account matching
+  # the reversed name would slip past the visibility gate.
+  defp matches(like, nil),
+    do: dynamic([u], person_ilike(u.first_name, u.last_name, u.username, ^like))
+
+  defp matches(like, reversed) do
+    dynamic(
+      [u],
+      person_ilike(u.first_name, u.last_name, u.username, ^like) or
+        name_ilike(u.first_name, u.last_name, ^reversed)
+    )
+  end
+
+  # "Petersen Jan" as "Jan Petersen", so the pair matches whichever way round
+  # it was typed — and `nil` for anything that is not two words, where the
+  # reversed pattern IS the plain one. Asking for it anyway is not free once
+  # the trigram indexes can serve these arms: it made three of the query's
+  # seven bitmap index scans literal duplicates.
+  defp reversed_name(term) do
+    case String.split(term, ~r/\s+/, trim: true) do
+      [first, last] -> contains(last <> " " <> first)
+      _not_a_pair -> nil
+    end
+  end
 
   defp search_members(query, nil), do: query
 

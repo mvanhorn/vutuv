@@ -155,7 +155,7 @@ Everything else has a default (the vutuv.de production value):
 | `MAILER_FROM_ADDRESS` | `no-reply@vutuv.de` | **Set this.** From address on every email |
 | `BOUNCE_ADDRESS` | `bounces@vutuv.de` | **Set this**, to a mailbox on your own domain that really accepts mail — bounces (DSNs) are addressed to it. It is the SMTP envelope sender only and never appears as a header, so it needs no display name and no human reading it; an alias or an automated handler is enough. Do not use a person's address: it is not shown to recipients, but it is what a remote postmaster replies to |
 | `OPERATOR_NAME` | `Wintermeyer Consulting` | **Set this.** Your name: site/email footer credit and operator-notice recipient name |
-| `OPERATOR_EMAIL` | `sw@wintermeyer-consulting.de` | **Set this.** Receives the daily report, ad bookings and account-deletion records; also the `security.txt` contact. **This pair is shown to visitors**, by name and as a `mailto:`, on the two pages that cannot say what went wrong: the 500 error page and the offline page the service worker keeps. Both ask the reader to come back later and to write to you if it persists, quoting the status code and the UTC minute, so use an address a human reads |
+| `OPERATOR_EMAIL` | `sw@wintermeyer-consulting.de` | **Set this.** Receives the daily report, ad bookings and cancellations, and account-deletion records; also the `security.txt` contact. **This pair is shown to visitors**, by name and as a `mailto:`, on the two pages that cannot say what went wrong: the 500 error page and the offline page the service worker keeps. Both ask the reader to come back later and to write to you if it persists, quoting the status code and the UTC minute, so use an address a human reads |
 | `OPERATOR_URL` | `https://wintermeyer-consulting.de` | **Set this.** Linked from the site/email footer |
 | `OPERATOR_ADDRESS` | (vutuv.de's) | **Set this.** One-line postal address in every email footer |
 | `SOURCE_URL` | `https://github.com/wintermeyer/vutuv` | Where the source of the software you run can be read — the footer's "Source" link and the commit link beside it, the bug-report links on the 400 error page and in the developer docs, and the `source_url` / `repository` fields both API discovery documents publish. **Change this if you run a modified vutuv:** the link claims to be the source of what your users are running, so once you have patched anything, ours is no longer an honest answer. vutuv is MIT, so this is about accuracy rather than a licence obligation |
@@ -165,6 +165,8 @@ Everything else has a default (the vutuv.de production value):
 | `MAIL_LOG_PATH` | `/var/log/mail.log` | Postfix log the bounce watcher tails; `""` = watcher off |
 | `DEPLOY_MINUTES` | `10` | How long installing a new version takes on your setup. The 500 page tells the visitor this number, because a deploy in flight is the commonest reason they are looking at it, and "come back later" is only useful with a figure on it. Ours is a blue/green deploy that builds, migrates and health-gates before the switch; set yours if your pipeline is slower |
 | `POST_EDIT_WINDOW_MINUTES` | `30` | How long a post stays editable after publishing. Editing also closes with the first like, repost or reply, whatever this value says (an edit would silently rewrite what somebody else endorsed); deleting is never blocked. Raise it for a closed community where posts get little immediate engagement |
+| `ADS_ENABLED` | `false` | Whether this installation sells the daily text ad — one ad per calendar day, booked by a member at `/system/ads`, released by an admin at `/admin/ads`, invoiced by you afterwards. Discount codes — a percentage or an amount off a booking, for one member or for anybody — are made at `/admin/ads/discounts`, which the dashboard and the review page both link. Off by default on purpose: the prices are vutuv.de's and are not configurable yet (350 € net a day, 2.000 € a week, 7.500 € a month), and the mails that reach you about a booking are written in German, so switching it on means agreeing to both. Off, no ad serves, the public flow and the review dashboard answer 404, and nothing can be booked; `ads` stays a reserved username either way. Only the exact value `true` turns it on. One thing to expect when you switch it on: an account sees no ad at all in its first two weeks, so a freshly registered test account shows nothing and that is the feature, not a broken installation |
+| `ADS_VAT_PERCENT` | `19` | The VAT you add on top of every ad price, in percent. Every price the ad system quotes — the offer page, the booking form, the preview, "My bookings" and both mails — is **net**, and this is the rate that turns it into the figure your invoice asks for (19 % is the German rate vutuv.de invoices at). Set your own country's rate, or `0` if you invoice without VAT, which drops the VAT line from every one of those surfaces |
 | `POST_DRAFT_RETENTION_DAYS` | `30` | How long the composer keeps a post somebody started and never sent, counted from the last change. Drafts are stored so a page reload cannot eat them, which means unpublished text of your members sits in your database — this is the retention promise your privacy page should quote. A draft is dropped the moment its post is sent, and any photo attached to it goes with it |
 | `DATA_LOCATION` | `Deutschland` | Where your installation's data physically lives, named on the start page's "Your data stays here" card ("on our own servers in X, in no foreign cloud"). **Set it to your own country or data centre, or to an empty value to drop that claim entirely** — which is what you must do if you run vutuv on rented cloud infrastructure, since the sentence says *our own servers*. The cookie sentence beside it is a property of the software and stays whatever you set here: vutuv sets one first-party cookie and loads nothing from another host |
 | `LANDING_EXAMPLE_PROFILE_URL` | `https://vutuv.de/wintermeyer` | The one profile the start page offers as "try it out" under its heading, and the profile the machine-readable format chips (Markdown, text, JSON, XML, vCard, RSS) in its technical section point at. A full URL, because the default has to keep working on an installation that has no filled-in profile yet — pointing at the reference installation is more useful there than a dead local link. Point it at one of your own members once you have one, or set it empty to drop the line and the chips (the installation-wide `/llms.txt` chip stays) |
@@ -234,7 +236,7 @@ Everything else has a default (the vutuv.de production value):
 | `MEDIA_KIT_MAX_LOGOS` | `5` | Most logo variants one member or one page may offer, counted separately from the photos. Five covers the light, dark, monochrome and square marks a design manual names, with one spare |
 | `SAVED_SEARCHES_MAX_PER_MEMBER` | `10` | Most saved searches (with e-mail alerts) one member may store (anti-abuse). A member at the cap is asked to delete one first |
 | `GEO_COUNTRIES` | `DE,AT,CH` | Comma-separated ISO 3166-1 alpha-2 codes whose bundled GeoNames postal data is loaded for offline zip → coordinate resolution on job postings. To add a country, drop its GeoNames zip export (`download.geonames.org/export/zip/<CC>.zip` → extracted `<CC>.txt`, optionally gzipped to `<CC>.txt.gz`) into `priv/geo/` and add the code here. Fully offline — no outbound calls |
-| `IMAGE_MODERATION_ENABLED` | `true` | `false` turns AI image moderation off (images publish immediately, as before the feature). While enabled, **every** image — avatars, covers, post / job-posting / organization images and the automatic link and homepage screenshots — waits invisible to everyone but its owner until a local Ollama vision model approves it; an unsafe image is deleted on the spot and the owner notified. Fail-closed: with Ollama unreachable, new images queue up and are scanned automatically once it is back — nothing is ever auto-approved. Set `false` only on installations without Ollama |
+| `IMAGE_MODERATION_ENABLED` | `true` | `false` turns AI image moderation off (images publish immediately, as before the feature). While enabled, **every** image — avatars, covers, post / job-posting / organization images and the automatic link and homepage screenshots — waits invisible to everyone but its owner until a local Ollama vision model approves it (a screenshot of a site on the admin's trusted list excepted, see "Trusted sites skip the image check"); an unsafe image is deleted on the spot and the owner notified. Fail-closed: with Ollama unreachable, new images queue up and are scanned automatically once it is back — nothing is ever auto-approved. Set `false` only on installations without Ollama |
 | `AI_CHECK_STALL_SECONDS` | `1800` | How long the scanner may be unreachable before a post waiting on one of its verdicts stops telling its author that a check is in progress and says plainly that the check cannot run. It changes **words, not the queue**: nothing is refused, nothing is released early, the retry goes on at its usual five-minute pace, and the post publishes itself the moment a verdict lands. Raise it on an installation whose GPU box is routinely away for an hour, so a normal absence is not called a stall; the chip in the app bar stops counting such a post as work in flight either way |
 | `IMAGE_PIXELATION_WINDOW_SECONDS` | `3600` | How long a picture waiting for that verdict shows readers a **pixelated preview** of itself — a separately stored file reduced to 64 cells on its long edge, not the picture behind a blur filter, so what reaches a reader carries none of the detail. It keeps a post card whole while the scan runs, and the real picture replaces it live the moment the verdict lands. Past this window the card falls back to a grey "being checked" tile, so a derivative of an unvetted picture never sits on a public page indefinitely. `0` switches the pixelated preview off entirely, which is the strictest posture |
 | `OLLAMA_URL` | `http://localhost:11434` | Base URL of the Ollama instance every AI feature talks to (image scan, translations, tag merge assist, employment-reference analysis). May be a **comma-separated list** (`http://gpu-box:11434,http://second-gpu:11434,http://localhost:11434`), which is read two ways at once. For a single call it is a **priority list**: every instance but the last is tried with a 30 s budget and skipped on any failure, the last one is the patient fallback (120 s, covers a CPU cold load). For calls that overlap it is also a **pool**: the second one starts on the least busy instance, so a second GPU takes work rather than waiting for the first to break. Verdicts are identical either way — the list only buys speed |
@@ -266,7 +268,10 @@ will try to reach vutuv.de's operator.
 
 A few rarely-changed switches are compile-time settings in
 `config/config.exs` / `config/prod.exs` (edit before `mix release`):
-`:ads_enabled` (the daily text-ad system, off by default),
+`:ads_enabled` (the daily text-ad system, off by default; bookings at
+`/system/ads`, the review at `/admin/ads`, booking and cancellation notices to
+`OPERATOR_EMAIL`), `:sweep_ad_sightings` (forgets which ads a member
+saw 90 days after the last sighting; on by default),
 `:ai_crawler_policy` (`:permissive` or `:block_training` — drives robots.txt
 and the Content-Signal headers), `:fetch_gravatar`, `:fetch_mastodon_posts`,
 `:fetch_bluesky_posts`, `:fetch_code_stats` (the profile "Code" card's
@@ -274,7 +279,9 @@ GitHub/GitLab/Codeberg and self-hosted Gitea/Forgejo statistics), `:generate_scr
 previews, an organization page's homepage capture **and** the auto-screenshot
 for single-link posts, including cached
 fediverse posts in the feed — admins watch the
-capture queue and browse the gallery at `/admin/screenshots`; a YouTube video
+capture queue, see the links refused for good with their reason (a site on
+that list over and over belongs on the blocklist) and browse the gallery at
+`/admin/screenshots`; a YouTube video
 link stores the video's published thumbnail instead of a capture, fetched
 server-side from YouTube under this same flag),
 `:fediverse_quote_resolve` (resolving what an incoming fediverse post
@@ -704,8 +711,10 @@ vutuv runs fine without internet access:
   post whose language nobody has placed is not a candidate for it, so on a
   fresh switch-on the sweep has almost nothing it is allowed to do until the
   detection pile is drained.
-- The map links on profile addresses (Google/OSM/Apple) are plain link-outs
-  rendered in the visitor's browser; they simply won't resolve offline.
+- The map link on a profile address (Google Maps, OpenStreetMap or Apple
+  Maps) is a plain link-out rendered in the visitor's browser; it simply
+  won't resolve offline. Set the default map to "No map link" at
+  `/admin/preferences` and untouched members see plain addresses.
 - Job postings need no configuration to work offline: their zip → coordinate
   resolution uses a bundled GeoNames postal dataset (`priv/geo/`), entirely
   offline with no outbound call. Add your intranet's country with
@@ -862,9 +871,9 @@ need distribution, which the reference setup disables.
 Some behaviour is a **member preference** with an installation-wide default:
 how many lines a post shows in the feed before "Read more" (desktop and
 mobile separately), whether post text hyphenates, how many lines of a post a
-notification on `/notifications` quotes, which map services appear on
-addresses and which one opens first. Members tune these on their own settings
-pages; you decide what everyone gets **until** they do.
+notification on `/notifications` quotes, and which map service an address on
+a profile links to, if any. Members tune these on their own settings pages;
+you decide what everyone gets **until** they do.
 
 One is the **interface language**. vutuv ships in English, German and Italian;
 a member picks theirs on their settings page, and a visitor who has picked
@@ -1026,6 +1035,36 @@ old consent-dialog pictures disappear on their own within a few passes.
 `SCREENSHOT_PAGE_CHECK=false` turns the whole thing off (an installation
 without Ollama, or one whose GPU should only do the safety scan); the blocklist
 then stays exactly what you write into it.
+
+### Trusted sites skip the image check
+
+With image moderation on, every screenshot waits for the AI safety scan
+before anyone but its owner sees it, the same as an uploaded photo. For a site
+like a public broadcaster that scan finds nothing to object to and still costs
+a model run per capture; on vutuv.de one news site accounted for close to half
+of all post screenshots. It can also misfire: news photos of a cannabis debate
+were thrown out as "drug paraphernalia".
+
+**`/admin` → Trusted sites** (`/admin/screenshots?tab=trusted`) lists the
+sites whose captures are released the moment they are stored. The list starts
+empty. An entry is a site, never a path:
+
+| Entry | Covers |
+| --- | --- |
+| `tagesschau.de` | `tagesschau.de` and `www.tagesschau.de`, nothing else |
+| `*.tagesschau.de` | the site and every subdomain |
+
+A bare entry deliberately does **not** cover other subdomains, the opposite of
+the blocklist: on a platform like `substack.com` or `github.io` every
+subdomain belongs to somebody else. Trust a site only when you trust
+everything it shows, its ads and embedded videos included. What counts is
+where the capture browser ended up, not the link a member posted: a capture is
+released without the scan only when every page the browser showed is on the
+list, so a trusted site that redirects somewhere else is scanned as usual.
+
+The list skips the safety scan and nothing else. The page check above still
+runs, the blocklist still wins, and removing a site only affects captures taken
+after that; pictures released while it was trusted stay up.
 
 ## "I didn't do anything!" — the account-activity log
 

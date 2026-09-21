@@ -421,8 +421,11 @@ defmodule VutuvWeb.PostComponents do
         {render_slot(@inner_block)}
       </div>
     </.card>
+    <%!-- Carded by its host instead (the profile's Posts card), which may be
+    flush in turn, so the rows carry the same name here. --%>
     <div
       :if={!@card}
+      data-timeline-rows
       class={["divide-y divide-slate-100 dark:divide-slate-800", @class]}
       {@rest}
     >
@@ -1522,18 +1525,35 @@ defmodule VutuvWeb.PostComponents do
           <div
             :for={reply <- @note.private_replies}
             :if={@viewer && reply.user_id == @viewer.id}
-            id={"private-reply-#{reply.id}"}
+            id={Fediverse.private_reply_anchor(reply.id)}
             data-private-reply={reply.id}
             class="mt-4 space-y-2 border-l-2 border-slate-200 pl-4 dark:border-slate-700"
           >
             <.remote_restricted_note>{gettext("Your private reply")}</.remote_restricted_note>
             <p class="whitespace-pre-wrap break-words text-slate-700 dark:text-slate-200">{reply.body}</p>
           </div>
+          <%!-- The same exchange as a conversation. One truth, two views, so
+          each one says where the other is; the link is batch-loaded onto the
+          note (`conversation_ref`) rather than looked up per card. --%>
+          <.link
+            :if={@note.conversation_ref}
+            id={"note-conversation-#{@note.id}"}
+            data-note-conversation
+            navigate={conversation_link(@note.conversation_ref)}
+            class="mt-3 inline-block text-xs font-semibold text-brand-600 hover:text-brand-700 dark:text-brand-400 dark:hover:text-brand-300"
+          >
+            {gettext("Open in messages")}
+          </.link>
         </div>
       </div>
     </article>
     """
   end
+
+  # The message this note also is, so the thread opens on the right line rather
+  # than at its end.
+  defp conversation_link(%{conversation_id: conversation_id, message_id: message_id}),
+    do: "#{~p"/messages/#{conversation_id}"}#message-#{message_id}"
 
   # ## The remote skin
   #

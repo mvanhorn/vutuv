@@ -8,6 +8,38 @@ defmodule Vutuv.ExportTest do
   use Vutuv.DataCase, async: true
   alias Vutuv.Export
 
+  test "a conversation with another network names the account on both sides" do
+    user = insert(:activated_user, fediverse_followers?: true)
+
+    account =
+      Repo.insert!(%Vutuv.Fediverse.RemoteAccount{
+        actor_uri: "https://social.example/users/alice",
+        inbox_uri: "https://social.example/users/alice/inbox",
+        host: "social.example",
+        handle: "alice",
+        name: "Alice Anders"
+      })
+
+    {:ok, conversation} = Vutuv.Chat.fediverse_conversation(user, account, :remote)
+
+    {:ok, _} =
+      Vutuv.Chat.record_fediverse_message(conversation, %{
+        direction: :in,
+        body: "Hallo!",
+        remote_object_uri: "https://social.example/statuses/1"
+      })
+
+    data = Export.build(user)
+
+    # Nobody over there has a participant row, so both the counterpart and the
+    # author have to be read off the conversation and the message instead — or
+    # a member asking what vutuv holds about them gets an exchange with nobody
+    # in it and a message from nobody.
+    assert [%{with: ["alice@social.example"], messages: [message]}] = data.conversations
+    assert message.from == "alice@social.example"
+    assert message.body == "Hallo!"
+  end
+
   test "connections are derived from mutual follows, one-way follows excluded" do
     user = insert(:activated_user)
     mutual = insert(:activated_user)
@@ -73,6 +105,67 @@ defmodule Vutuv.ExportTest do
     assert draft.tags == "elixir"
     assert draft.replying_to_post_id == nil
     assert draft.image_count == 0
+  end
+
+  test "the ads a member saw are in the export, with when and how often (schema v13)" do
+    user = insert(:activated_user)
+
+    ad =
+      insert(:ad,
+        day: ~D[2026-04-14],
+        title: "Acme sucht Leute",
+        body: "Elixir in Mainz.",
+        url: "https://acme.example/jobs"
+      )
+
+    insert(:ad_sighting,
+      user: user,
+      ad: ad,
+      first_seen_at: ~U[2026-09-10 08:02:00Z],
+      last_seen_at: ~U[2026-09-10 10:31:00Z],
+      times_seen: 3
+    )
+
+    data = Export.build(user)
+
+    assert data.schema_version >= 13
+
+    assert data.seen_ads == [
+             %{
+               day: ~D[2026-04-14],
+               title: "Acme sucht Leute",
+               body: "Elixir in Mainz.",
+               url: "https://acme.example/jobs",
+               first_seen_at: ~U[2026-09-10 08:02:00Z],
+               last_seen_at: ~U[2026-09-10 10:31:00Z],
+               times_seen: 3
+             }
+           ]
+  end
+
+  test "a member's ad bookings say where they stand (schema v13)" do
+    user = insert(:activated_user)
+
+    insert(:ad,
+      user: user,
+      day: ~D[2026-04-15],
+      approved_at: nil,
+      rejected_at: ~U[2026-04-10 09:00:00Z],
+      rejection_reason: "Zu laut.",
+      price_cents: 99_000
+    )
+
+    assert [booking] = Export.build(user).ad_bookings
+
+    assert %{
+             status: :rejected,
+             rejection_reason: "Zu laut.",
+             price_cents: 99_000,
+             day: ~D[2026-04-15]
+           } =
+             booking
+
+    refute Map.has_key?(booking, :approved)
   end
 
   test "a member's account deletion takes their drafts with it" do

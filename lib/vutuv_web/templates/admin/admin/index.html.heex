@@ -1,12 +1,10 @@
 <.page_header title={gettext("Admin control panel")} crumbs={[gettext("Admin")]} />
 
-<p class="-mt-2 mb-8 max-w-2xl text-sm text-slate-600 dark:text-slate-400">
-  {gettext("Everything that keeps vutuv running, in one place. Cards with open work glow in coral.")}
-</p>
-
 <%!-- The client IP as the app actually sees it: a live check that nginx forwards
 X-Forwarded-For (issues #799, #837). A loopback/private address here means the
-per-IP rate limiter and the security email only ever see the proxy hop. --%>
+per-IP rate limiter and the security email only ever see the proxy hop, and that
+is work to do, so the warning keeps the top of the page. The healthy line is
+only a reassurance and waits at the foot, below the cards. --%>
 <%= if @proxy_hop? do %>
   <div
     id="admin-proxy-ip-warning"
@@ -25,11 +23,6 @@ per-IP rate limiter and the security email only ever see the proxy hop. --%>
       )}
     </p>
   </div>
-<% else %>
-  <p class="mb-8 text-sm text-slate-600 dark:text-slate-400">
-    {gettext("Your IP address, as vutuv sees it:")}
-    <code class="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-slate-800 dark:bg-slate-800 dark:text-slate-200">{@client_ip}</code>
-  </p>
 <% end %>
 
 <%!-- The live activity pulse, embedded like ShellLive so its counts and the
@@ -225,6 +218,19 @@ per-IP rate limiter and the security email only ever see the proxy hop. --%>
     >
       {gettext(
         "Pages never to screenshot, because a headless capture only ever gets their cookie banner or login wall. Add a domain or a single URL, and the links stay plain instead."
+      )}
+    </.admin_card>
+
+    <.admin_card
+      icon="shield"
+      title={gettext("Trusted sites")}
+      href={~p"/admin/screenshots?tab=trusted"}
+      id="admin-screenshot-trusted-link"
+      count={@screenshot_trusted_count}
+      cta={gettext("Edit the trusted sites")}
+    >
+      {gettext(
+        "Sites whose screenshots skip the AI image check, such as a public broadcaster. Their captures show at once and cost the check no work."
       )}
     </.admin_card>
   </.admin_group>
@@ -437,5 +443,35 @@ per-IP rate limiter and the security email only ever see the proxy hop. --%>
         )}
       <% end %>
     </.admin_card>
+
+    <%!-- Its own tile rather than a line inside the ads card: the whole card is
+    one link, so a second destination cannot live in it, and making a code is
+    what an admin comes here for, not a detail of the review. --%>
+    <.admin_card
+      :if={@ads_enabled}
+      icon="ticket"
+      title={gettext("Ad discount codes")}
+      count={@live_discount_codes_count}
+      href={~p"/admin/ads/discounts"}
+      id="admin-ad-discounts-link"
+      cta={gettext("Make a code")}
+    >
+      {gettext("Percent or euro off an ad booking, for one member or for anybody.")}
+      <%= if @live_discount_codes_count == 0 do %>
+        {gettext("No code is out at the moment.")}
+      <% else %>
+        {ngettext(
+          "%{formatted} code is valid right now.",
+          "%{formatted} codes are valid right now.",
+          @live_discount_codes_count,
+          formatted: compact_count(@live_discount_codes_count)
+        )}
+      <% end %>
+    </.admin_card>
   </.admin_group>
 </div>
+
+<p :if={!@proxy_hop?} id="admin-client-ip" class="mt-10 text-sm text-slate-600 dark:text-slate-400">
+  {gettext("Your IP address, as vutuv sees it:")}
+  <code class="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-slate-800 dark:bg-slate-800 dark:text-slate-200">{@client_ip}</code>
+</p>

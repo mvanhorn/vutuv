@@ -18,12 +18,22 @@ defmodule VutuvWeb.MessageLive.Index do
   use VutuvWeb, :live_view
 
   import VutuvWeb.PendingPostComponents, only: [file_label: 1]
+  import VutuvWeb.PostComponents, only: [remote_avatar: 1, remote_initials: 1]
 
+  alias Vutuv.Accounts
+
+  alias Vutuv.Accounts.User
   alias Vutuv.Attachments
   alias Vutuv.Attachments.Attachment
   alias Vutuv.Attachments.Format
   alias Vutuv.Chat
   alias Vutuv.Chat.{Conversation, Message}
+  alias Vutuv.Fediverse
+  alias Vutuv.Fediverse.Note
+  alias Vutuv.Fediverse.PrivateMessage
+  alias Vutuv.Fediverse.RemoteAccount
+  alias Vutuv.Fediverse.RemoteFollow
+  alias Vutuv.Moderation
   alias Vutuv.Organizations
   alias Vutuv.Organizations.Organization
   alias Vutuv.Posts
@@ -58,6 +68,17 @@ defmodule VutuvWeb.MessageLive.Index do
      |> assign(:online_ids, Presence.online_ids())
      |> assign(:conversation, nil)
      |> assign(:other, nil)
+     # The recipient finder above the list: what is typed, what it found on
+     # each side, an address it could offer to look up, and the last refusal.
+     # `can_write_remote?` is the member's own Fediverse standing, asked once
+     # per mount — a field that takes an address and then explains it cannot
+     # send is a field that wasted the typing.
+     |> assign(:recipient_query, "")
+     |> assign(:recipient_members, [])
+     |> assign(:recipient_accounts, [])
+     |> assign(:recipient_lookup, nil)
+     |> assign(:lookup_error, nil)
+     |> assign(:can_write_remote?, Fediverse.federated?(user))
      |> assign(:more?, false)
      |> assign(:cursor, nil)
      |> assign_sidebar()
@@ -75,6 +96,43 @@ defmodule VutuvWeb.MessageLive.Index do
      )
      |> assign_form()}
   end
+
+  # An `@name@server` this installation does not already hold, or nil. What it
+  # answers for is the row that offers to go and ask; everything it finds in
+  # the table above needs no request at all.
+  #
+  # An address on our OWN host is a member, never a row to go and ask about:
+  # the members half above has already folded it to the bare handle
+  # (`Handles.normalize/1`) and found them. Offering the lookup beside that
+  # would send this installation to WebFinger itself, which `follow_remote/2`
+  # refuses as `:local_account` — a dead end at the end of a spent request.
+  defp unknown_address(term) do
+    address = String.trim(term)
+
+    with {:ok, {_name, host}} <- RemoteFollow.parse_address(address),
+         false <- Fediverse.local_host?(host),
+         nil <- Fediverse.remote_account_by_address(address) do
+      address
+    else
+      _ours_or_known_or_invalid -> nil
+    end
+  end
+
+  # The same id on both sides, so the two positions are constrained to be equal
+  # — deliberate here, where that is the whole question.
+  defp viewer?(%{id: id}, %{id: id}), do: true
+  defp viewer?(_member, _viewer), do: false
+
+  defp open_conversation(socket, {:ok, %Conversation{} = conversation}),
+    do: {:noreply, push_navigate(socket, to: ~p"/messages/#{conversation.id}")}
+
+  defp open_conversation(socket, {:error, :rate_limited}),
+    do:
+      {:noreply,
+       put_flash(socket, :error, gettext("Too many new conversations. Please try again later."))}
+
+  defp open_conversation(socket, {:error, _reason}),
+    do: {:noreply, put_flash(socket, :error, gettext("This account cannot receive messages."))}
 
   # Whose inbox this is. A publisher who switched into a page (issue #1335)
   # reads the PAGE's messages at this same URL and answers in its name; anybody
@@ -211,6 +269,38 @@ defmodule VutuvWeb.MessageLive.Index do
     end
   end
 
+  # The Fediverse account page's "Message" button. A conversation with an
+  # account on another network needs the member's own Fediverse standing, so
+  # the refusal is shown here rather than hidden: somebody who has not
+  # switched participation on must be able to find out that they can.
+  defp apply_action(socket, :new_fediverse, %{"id" => id} = params) do
+    viewer = socket.assigns.current_user
+
+    with %RemoteAccount{} = account <- Fediverse.get_remote_account(id),
+         :ok <- Fediverse.check_direct_message(viewer, account),
+         {:ok, conversation} <- Chat.fediverse_conversation(viewer, account, :member) do
+      push_navigate(socket, to: new_conversation_path(conversation.id, params["body"]))
+    else
+      {:error, :not_federating} ->
+        socket
+        |> put_flash(
+          :error,
+          gettext(
+            "Switch Fediverse participation on under Settings to write to accounts on other networks."
+          )
+        )
+        |> push_navigate(to: ~p"/settings/fediverse")
+
+      # An account this installation does not hold, a blocked server, an actor
+      # whose document names somebody else's inbox: one sentence, because none
+      # of them is the member's to act on.
+      _refused ->
+        socket
+        |> put_flash(:error, gettext("This account cannot receive messages."))
+        |> push_navigate(to: ~p"/messages")
+    end
+  end
+
   # A `?body=` param prefills the composer once, on open.
   defp seed_draft(socket, body) when is_binary(body) and body != "",
     do: assign(socket, :form, to_form(%{"body" => body}, as: :message))
@@ -231,8 +321,16 @@ defmodule VutuvWeb.MessageLive.Index do
   defp send_as(socket, body, attachment_ids) do
     # `socket.assigns.viewer` is the identity being SPOKEN AS; `current_user` is
     # always the human at the keyboard. A page's reply needs both.
-    case socket.assigns.viewer do
-      %Organization{} = page ->
+    #
+    # The one branch that is about the OTHER side rather than the viewer: a
+    # message to another network has to be signed and delivered, which is the
+    # Fediverse context's business — it writes the conversation's row itself
+    # once the delivery is queued.
+    case {socket.assigns.other, socket.assigns.viewer} do
+      {%RemoteAccount{} = account, _viewer} ->
+        Fediverse.send_direct_message(socket.assigns.current_user, account, body)
+
+      {_other, %Organization{} = page} ->
         Chat.send_message_as_organization(
           page,
           socket.assigns.current_user,
@@ -240,14 +338,76 @@ defmodule VutuvWeb.MessageLive.Index do
           body
         )
 
-      user ->
+      {_other, user} ->
         Chat.send_message(user, socket.assigns.conversation.id, body,
           attachment_ids: attachment_ids
         )
     end
   end
 
+  # Who the member might mean, on both sides at once. Two cheap queries per
+  # keystroke (debounced in the markup), and **no** request to anybody: an
+  # address nobody here has met only ever becomes an offer to look it up.
+  #
+  # Its own event name, and not `typing`: this page already answers that one
+  # with the thread's typing indicator.
   @impl true
+  def handle_event("find-recipient", %{"q" => term}, socket) do
+    user = socket.assigns.current_user
+    remote? = socket.assigns.can_write_remote?
+
+    {:noreply,
+     socket
+     |> assign(:recipient_query, term)
+     |> assign(:lookup_error, nil)
+     |> assign(
+       :recipient_members,
+       Accounts.search_people(user, term, limit: 6, include_self: true)
+     )
+     |> assign(:recipient_accounts, if(remote?, do: Fediverse.search_accounts(term), else: []))
+     |> assign(:recipient_lookup, remote? && unknown_address(term))}
+  end
+
+  def handle_event("write-to-member", %{"id" => id}, socket) do
+    case Accounts.get_user(id) do
+      nil ->
+        {:noreply, put_flash(socket, :error, gettext("Member not found."))}
+
+      member ->
+        open_conversation(
+          socket,
+          Chat.find_or_create_conversation(socket.assigns.current_user, member)
+        )
+    end
+  end
+
+  def handle_event("write-to-account", %{"id" => id}, socket) do
+    user = socket.assigns.current_user
+
+    with %RemoteAccount{} = account <- Fediverse.get_remote_account(id),
+         :ok <- Fediverse.check_direct_message(user, account) do
+      open_conversation(socket, Chat.fediverse_conversation(user, account, :member))
+    else
+      _refused ->
+        {:noreply, assign(socket, :lookup_error, :not_found)}
+    end
+  end
+
+  # The one act in the finder that leaves the building, which is why it is a
+  # press of its own rather than part of the search above it.
+  def handle_event("look-up-address", %{"address" => address}, socket) do
+    user = socket.assigns.current_user
+
+    with true <- socket.assigns.can_write_remote?,
+         {:ok, account} <- Fediverse.resolve_remote_account(user, address),
+         :ok <- Fediverse.check_direct_message(user, account) do
+      open_conversation(socket, Chat.fediverse_conversation(user, account, :member))
+    else
+      false -> {:noreply, socket}
+      {:error, reason} -> {:noreply, assign(socket, :lookup_error, reason)}
+    end
+  end
+
   def handle_event("send", %{"message" => params}, socket) do
     body = params |> Map.get("body", "") |> String.trim()
     socket = adopt_recovered_attachments(socket, params["attachment_ids"])
@@ -884,6 +1044,20 @@ defmodule VutuvWeb.MessageLive.Index do
     """
   end
 
+  # An account on another network wears the same tile its replies wear under a
+  # post: initials (or its picture, once the gate cleared one) with the globe
+  # badge that says "not from here".
+  defp party_avatar(%{party: %RemoteAccount{}} = assigns) do
+    assigns =
+      assigns
+      |> assign(:src, RemoteAccount.avatar_url(assigns.party))
+      |> assign(:initials, remote_initials(assigns.party))
+
+    ~H"""
+    <.remote_avatar initials={@initials} src={@src} size="sm" />
+    """
+  end
+
   defp party_avatar(assigns) do
     ~H"""
     <.avatar user={@party} size="sm" />
@@ -899,8 +1073,15 @@ defmodule VutuvWeb.MessageLive.Index do
   # `Chat.request_recipient?/2` already give the right answer for it, and asking
   # the kind in front of them would put the same rule in two layers.
   defp member_party?(%Organization{}), do: false
+  defp member_party?(%RemoteAccount{}), do: false
   defp member_party?(nil), do: false
   defp member_party?(_), do: true
+
+  # Whether the other side reads this on another server, which is the one
+  # thing about a conversation the member has to be told: what they write
+  # leaves the building, and it is private but not encrypted.
+  defp remote_party?(%RemoteAccount{}), do: true
+  defp remote_party?(_), do: false
 
   # Exactly one of the two sender columns is filled, so each side asks about
   # its own; a bare `sender_id == id` would answer NULL for the other's rows.
@@ -912,6 +1093,33 @@ defmodule VutuvWeb.MessageLive.Index do
 
   defp mine?(%Message{sender_id: sender_id}, %{id: user_id}),
     do: not is_nil(sender_id) and sender_id == user_id
+
+  # The post a Fediverse message hangs under, or nil for one that answers no
+  # post. The post is always the viewer's own — a private answer arrives under
+  # their post, and a sent one is their answer to it — so the id is all the
+  # permalink needs.
+  defp post_path(%Message{} = message, %User{} = viewer) do
+    case source_anchor(message) do
+      {post_id, anchor} when is_binary(post_id) -> Posts.path(viewer, post_id) <> "#" <> anchor
+      _none -> nil
+    end
+  end
+
+  defp post_path(_message, _viewer), do: nil
+
+  # The post **and the fragment**, never the post alone: a conversation that
+  # has run for a while hangs under a post with a whole thread under it, and a
+  # link that only opens that page leaves the reader hunting for the message
+  # they pressed. Both anchors are owned by `Vutuv.Fediverse`, which is also
+  # where the two boxes under the post get their `id` — a fragment matching
+  # nothing fails silently, by opening the page at the top.
+  defp source_anchor(%Message{note: %Note{id: id, post_id: post_id}}),
+    do: {post_id, Fediverse.reply_anchor(id)}
+
+  defp source_anchor(%Message{private_message: %PrivateMessage{id: id, post_id: post_id}}),
+    do: {post_id, Fediverse.private_reply_anchor(id)}
+
+  defp source_anchor(_message), do: nil
 
   # The Accept/Decline pair, shared by the sidebar request rows and the
   # in-thread request banner.
@@ -965,6 +1173,177 @@ defmodule VutuvWeb.MessageLive.Index do
           @conversation && "hidden"
         ]}
       >
+        <%!-- Finding somebody to write to. One field for both worlds, because
+        the member's question is "who", never "on which server": a name finds
+        members here (first, last, both, either way round — `search_people/3`),
+        an `@name@server` finds accounts on other networks, and an address
+        nobody here has met yet gets its own row offering to look it up. That
+        last one is a request to a foreign server and a slot of the hourly
+        budget, so it stays something the member presses, never something the
+        page does while they type.
+
+        The field is always on screen rather than behind a control: the list
+        under it is the one place a conversation starts, and a disclosure only
+        added a click in front of the commonest act. --%>
+        <div class="border-b border-slate-200 px-4 pb-3 pt-2 dark:border-slate-800">
+          <form
+            id="recipient-search-form"
+            phx-change="find-recipient"
+            phx-submit="find-recipient"
+            autocomplete="off"
+          >
+            <label for="recipient-search" class="sr-only">{gettext("Find somebody to write to")}</label>
+            <input
+              type="text"
+              name="q"
+              id="recipient-search"
+              value={@recipient_query}
+              phx-debounce="250"
+              inputmode="email"
+              autocapitalize="none"
+              autocorrect="off"
+              spellcheck="false"
+              placeholder={gettext("Name or @name@server")}
+              class={input_class()}
+            />
+          </form>
+
+          <%!-- What this field can do, said once and plainly — neither half is
+          guessable from a placeholder, the username least of all, and the
+          Fediverse half is not available to everybody. The sentence they share
+          is one msgid, so a translator meets it once. --%>
+          <p class="mt-1.5 text-xs leading-relaxed text-slate-600 dark:text-slate-400">
+            {gettext("Search vutuv members by first name, last name, both or their username.")}
+            <%= if @can_write_remote? do %>
+              {gettext("An address like @name@server reaches somebody on another network.")}
+            <% else %>
+              {gettext("Switch Fediverse participation on to write to accounts on other networks.")}
+              <.link
+                navigate={~p"/settings/fediverse"}
+                class="font-semibold text-brand-600 hover:text-brand-700 dark:text-brand-400 dark:hover:text-brand-300"
+              >
+                {gettext("Open the setting")}
+              </.link>
+            <% end %>
+          </p>
+
+          <p
+            :if={@lookup_error}
+            id="recipient-error"
+            role="alert"
+            class="mt-2 text-sm font-medium text-red-700 dark:text-red-300"
+          >
+            {VutuvWeb.FediverseComponents.refusal_message(@lookup_error)}
+          </p>
+        </div>
+
+        <%!-- The results, above the conversations and only while something is
+        typed: members first (they are who most searches are for), then the
+        accounts this installation already holds, then the offer to look an
+        unknown address up. --%>
+        <div :if={@recipient_query != ""} id="recipient-results" class="border-b border-slate-200 dark:border-slate-800">
+          <div :if={@recipient_members != []} class="grp-people">
+            <p class="px-4 pt-3 text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+              {gettext("vutuv members")}
+            </p>
+            <%!-- Your own row is shown and disabled rather than left out: a
+            search for your own name that answers "nobody" reads as a broken
+            search, not as a rule. `disabled` is what makes it unavailable —
+            the greying only says so — and `Chat.find_or_create_conversation/2`
+            refuses a pair of one anyway, so the guard does not live here. --%>
+            <button
+              :for={member <- @recipient_members}
+              type="button"
+              disabled={viewer?(member, @current_user)}
+              phx-click="write-to-member"
+              phx-value-id={member.id}
+              data-recipient="member"
+              data-recipient-self={viewer?(member, @current_user)}
+              class={[
+                "flex w-full items-center gap-3 px-4 py-2.5 text-left",
+                if(viewer?(member, @current_user),
+                  do: "cursor-default opacity-60",
+                  else: "hover:bg-slate-50 dark:hover:bg-slate-800"
+                )
+              ]}
+            >
+              <.avatar user={member} size="sm" />
+              <span class="min-w-0">
+                <span class="block truncate text-sm font-medium text-slate-800 dark:text-slate-100">
+                  {Vutuv.Identity.display_name(member)}
+                </span>
+                <span class="block truncate text-xs text-slate-600 dark:text-slate-400">
+                  @{member.username}
+                </span>
+              </span>
+              <span
+                :if={viewer?(member, @current_user)}
+                class="ml-auto shrink-0 text-xs font-medium text-slate-500 dark:text-slate-400"
+              >
+                {gettext("That's you")}
+              </span>
+            </button>
+          </div>
+
+          <div :if={@recipient_accounts != []}>
+            <p class="px-4 pt-3 text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+              {gettext("Other networks")}
+            </p>
+            <button
+              :for={account <- @recipient_accounts}
+              type="button"
+              phx-click="write-to-account"
+              phx-value-id={account.id}
+              data-recipient="account"
+              class="flex w-full items-center gap-3 px-4 py-2.5 text-left hover:bg-slate-50 dark:hover:bg-slate-800"
+            >
+              <.remote_avatar initials={remote_initials(account)} src={RemoteAccount.avatar_url(account)} size="sm" />
+              <span class="min-w-0">
+                <span class="block truncate text-sm font-medium text-slate-800 dark:text-slate-100">
+                  {Vutuv.Identity.display_name(account)}
+                </span>
+                <span class="block truncate text-xs text-slate-600 dark:text-slate-400">
+                  {RemoteAccount.display_handle(account)}
+                </span>
+              </span>
+            </button>
+          </div>
+
+          <%!-- An address this installation has never seen. Offered as a row
+          rather than resolved on the keystroke, because it leaves the
+          building. --%>
+          <button
+            :if={@recipient_lookup}
+            type="button"
+            phx-click="look-up-address"
+            phx-value-address={@recipient_lookup}
+            phx-disable-with={gettext("Looking it up…")}
+            data-recipient="lookup"
+            class="flex w-full items-center gap-3 border-t border-slate-100 px-4 py-3 text-left hover:bg-slate-50 dark:border-slate-800 dark:hover:bg-slate-800"
+          >
+            <span class="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400">
+              <.detail_icon name="globe" class="h-4 w-4" />
+            </span>
+            <span class="min-w-0">
+              <span class="block truncate text-sm font-medium text-slate-800 dark:text-slate-100">
+                {gettext("Look this address up")}
+              </span>
+              <span class="block truncate text-xs text-slate-600 dark:text-slate-400">
+                {@recipient_lookup}
+              </span>
+            </span>
+          </button>
+
+          <p
+            :if={@recipient_members == [] and @recipient_accounts == [] and is_nil(@recipient_lookup)}
+            class="px-4 py-3 text-sm text-slate-600 dark:text-slate-400"
+          >
+            {if String.length(@recipient_query) < 2,
+              do: gettext("Type at least two characters."),
+              else: gettext("Nobody found.")}
+          </p>
+        </div>
+
         <%!-- The lists load only once the socket has joined (see
         `assign_sidebar/1`), and on a slow line that leaves this card blank for
         seconds after the page itself is on screen — which reads as "you have
@@ -1108,6 +1487,24 @@ defmodule VutuvWeb.MessageLive.Index do
           </button>
         </div>
 
+        <%!-- Said once per conversation, at the top, where somebody reads it
+        before writing rather than under every bubble: what leaves the building,
+        and that private here does not mean encrypted. --%>
+        <p
+          :if={remote_party?(@other)}
+          id="fediverse-privacy-note"
+          class="mx-4 mt-4 flex items-start gap-2 rounded-xl bg-slate-50 px-3 py-2 text-xs leading-relaxed text-slate-600 ring-1 ring-slate-200 dark:bg-slate-800/60 dark:text-slate-300 dark:ring-slate-700"
+        >
+          <span aria-hidden="true">🔒</span>
+          <span>
+            {gettext(
+              "Only %{name} (%{host}) receives these messages. Like emails, they are not end-to-end encrypted.",
+              name: display_name(@other),
+              host: @other.host
+            )}
+          </span>
+        </p>
+
         <div id="message-thread" phx-update="stream" phx-hook="ScrollBottom" class="flex-1 space-y-2 overflow-y-auto p-4">
           <div
             :for={{dom_id, m} <- @streams.messages}
@@ -1147,6 +1544,20 @@ defmodule VutuvWeb.MessageLive.Index do
               <span :if={m.frozen_at} class="mt-1 block text-[10px] font-semibold text-white/80">
                 ⚑ <.link navigate={~p"/moderation/cases"} class="underline">{gettext("Hidden: reported, under review")}</.link>
               </span>
+              <%!-- The other half of "one truth, two views": this message is
+              also a note (or a sent reply) under one of the member's posts,
+              and this is the way back to it. --%>
+              <.link
+                :if={post_path(m, @viewer)}
+                id={"#{dom_id}-post"}
+                navigate={post_path(m, @viewer)}
+                class={[
+                  "mt-1 block text-[10px] font-semibold underline",
+                  if(mine?(m, @viewer), do: "text-white/80", else: "text-brand-700 dark:text-brand-300")
+                ]}
+              >
+                {gettext("To the post")}
+              </.link>
               <.local_time
                 id={"#{dom_id}-at"}
                 at={m.inserted_at}
@@ -1159,8 +1570,15 @@ defmodule VutuvWeb.MessageLive.Index do
             <%!-- The quiet per-message report flag, beside the other side's
             bubbles. Faint until the row is hovered or the flag is focused, so
             it never crowds the conversation; always tappable on touch. --%>
+            <%!-- Asked of `Moderation`, not of the party kind: a report
+            strikes the member who wrote the thing, and a message from another
+            network — or from a page — has none, so the flag would be a control
+            that always fails. What answers that complaint instead is the
+            note's own report under the post (`Fediverse.report_note/2`, which
+            also files a `Flag` with the origin server), muting the account, or
+            the operator's server block. --%>
             <.link
-              :if={not mine?(m, @viewer)}
+              :if={not mine?(m, @viewer) and Moderation.reportable?(m)}
               id={"#{dom_id}-report"}
               navigate={~p"/reports/new?#{[type: "message", id: m.id, return_to: "/messages/#{m.conversation_id}"]}"}
               title={gettext("Report this message")}
@@ -1207,7 +1625,7 @@ defmodule VutuvWeb.MessageLive.Index do
             id="request-banner"
             class="flex flex-wrap items-center justify-center gap-2 border-t border-slate-200 p-3 text-sm text-slate-600 dark:border-slate-800 dark:text-slate-300"
           >
-            <span>{gettext("@%{slug} wants to message you.", slug: @other.username)}</span>
+            <span>{gettext("@%{slug} wants to message you.", slug: Vutuv.Identity.handle(@other))}</span>
             <.request_actions id={@conversation.id} />
           </div>
         </div>
@@ -1311,7 +1729,7 @@ defmodule VutuvWeb.MessageLive.Index do
           id="awaiting-acceptance"
           class="border-t border-slate-200 p-4 text-center text-sm text-slate-600 dark:text-slate-400 dark:border-slate-800"
         >
-          {gettext("@%{slug} has not accepted your message request yet.", slug: @other.username)}
+          {gettext("@%{slug} has not accepted your message request yet.", slug: Vutuv.Identity.handle(@other))}
         </p>
       </section>
 

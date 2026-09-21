@@ -42,6 +42,35 @@ defmodule VutuvWeb.UI do
   alias VutuvWeb.Markdown
 
   @doc """
+  The "N/max characters" readout beside a length-capped field, which the
+  `[data-char-counter]` enhancement in `app.js` keeps current while the member
+  types: a `data-char-counter` wrapper holds it and the field, which carries
+  `data-char-count-input`. The readout names the cap (`data-max`), and `value`
+  is what the field holds, so the number is right before any script runs; the
+  server's `validate_length` stays the rule.
+  """
+  attr(:value, :any, required: true)
+  attr(:max, :integer, required: true)
+
+  def char_count(assigns) do
+    assigns = assign(assigns, :used, String.length(to_string(assigns.value)))
+
+    ~H"""
+    <p
+      data-char-count-readout
+      data-max={@max}
+      data-over={to_string(@used > @max)}
+      aria-live="polite"
+      class="shrink-0 whitespace-nowrap text-sm text-slate-600 data-[over=true]:font-medium data-[over=true]:text-red-600 dark:text-slate-400 dark:data-[over=true]:text-red-400"
+    >
+      <span data-char-count>{@used}</span>/{@max} {gettext("characters")}
+      <span data-char-ok aria-hidden="true" class="text-emerald-600 dark:text-emerald-400">✓</span>
+      <span data-char-over aria-hidden="true" class="hidden">⚠</span>
+    </p>
+    """
+  end
+
+  @doc """
   Render a user-written Markdown prose field — a work-experience or education
   `description` (issue #905) — as sanitized HTML in the Direction A `.markdown`
   body recipe. It runs through `VutuvWeb.Markdown.render/1`, so a description
@@ -74,12 +103,12 @@ defmodule VutuvWeb.UI do
   track, `<main>` and the footer's content column. A container that is already
   inside one of those needs nothing — the insets do not stack.
 
-  **One container cancels it instead**, the feed's flush timeline card, which
-  negates this expression in the phone-timeline block at the end of `app.css`
-  to reach the edge of the screen. The two spellings have to move together —
-  change the gutter here and the card would negate the old amount, leaving the
-  timeline a few pixels off one edge on every phone. `feed_edge_to_edge_test.exs`
-  fails when they drift.
+  **Two containers cancel it instead**, the feed's flush timeline card and the
+  profile's grid, which negate this expression in the phone block at the end of
+  `app.css` (both read one pair of custom properties there) to reach the edge
+  of the screen. The two spellings have to move together — change the gutter
+  here and they would negate the old amount, leaving the page a few pixels off
+  one edge on every phone. `feed_edge_to_edge_test.exs` fails when they drift.
   """
   def gutter_class do
     "pl-[max(1rem,env(safe-area-inset-left))] pr-[max(1rem,env(safe-area-inset-right))]"
@@ -1078,6 +1107,10 @@ defmodule VutuvWeb.UI do
   `app.css`, which is also where the reasoning lives: the card cancels the
   gutter, hands its side padding to each **row** (so the hairline between two
   posts runs the whole width of the screen), and squares its corners.
+
+  Every card also carries a bare `data-card`, so a page can restyle all of its
+  cards from the stylesheet without a class per call site: the profile runs
+  each one edge to edge on a phone (`[data-profile-edge]`, the same block).
   """
   attr(:class, :string, default: nil)
 
@@ -1092,6 +1125,7 @@ defmodule VutuvWeb.UI do
   def card(assigns) do
     ~H"""
     <section
+      data-card
       data-timeline-flush={@flush}
       class={[
         "rounded-2xl bg-white p-6 shadow-sm ring-1 ring-slate-200 dark:bg-slate-900 dark:ring-slate-800",
@@ -3793,6 +3827,26 @@ defmodule VutuvWeb.UI do
   end
 
   @doc """
+  An amount of cents as money, always with both decimals (`41650` ->
+  `"416,50"` under German and Italian, `"416.50"` under English).
+
+  Money keeps its cents even when they are zero: a price list where `350` sits
+  beside `416,50` reads as two different kinds of number. Grouping and decimal
+  separator come from `number_separators/0`, the same pair `delimited_count/1`
+  uses — they invert together between the locales, so a figure formatted with
+  the wrong rules is misread rather than untidy.
+  """
+  def euro_cents(cents) when is_integer(cents) do
+    {_separator, decimal} = number_separators()
+    sign = if cents < 0, do: "-", else: ""
+    cents = abs(cents)
+
+    sign <>
+      delimited_count(div(cents, 100)) <>
+      decimal <> (cents |> rem(100) |> Integer.to_string() |> String.pad_leading(2, "0"))
+  end
+
+  @doc """
   Exact, thousands-grouped form of a count (`60123` -> `"60,123"`, or
   `"60.123"` under the German locale), for the rare place that wants the full
   number rather than the floored `compact_count/1` — the live member counter on
@@ -3814,12 +3868,40 @@ defmodule VutuvWeb.UI do
     if n < 0, do: "-" <> digits, else: digits
   end
 
+  @doc """
+  The decimal separator of the reader's locale on its own, for a figure this
+  module does not format itself.
+
+  Three call sites want the decimal without the grouping — a file size in
+  megabytes, a click rate as a percentage — and each of them used to carry its
+  own copy of the locale rule. One copy per site is one place per site to
+  forget a language, which is exactly what French found: it shares German's
+  comma but *not* German's dot, so the `in ~w(de it)` shorthand those copies
+  used answers half of French correctly and reads as if it answered all of it.
+  """
+  def decimal_separator do
+    {_group, decimal} = number_separators()
+    decimal
+  end
+
   # German and Italian group thousands with a dot and write the decimal with a
   # comma (60.023 / 2,4); English inverts both. They invert **together**, so
   # they are one answer rather than two lists to keep in step — the wrong one is
   # misread rather than untidy.
+  #
+  # French takes the comma but groups with a narrow no-break space (U+202F,
+  # `60 023`), so it is the locale that broke the two-way split this used to be:
+  # it belongs to neither branch, and whichever one it had been folded into
+  # would have been wrong about one of the two separators. The space is
+  # deliberately the *narrow* no-break one CLDR names for `fr` and not a plain
+  # space — a normal space lets a browser break `60 023` across two lines, and
+  # half a number at the end of a line is not a number.
   defp number_separators do
-    if Gettext.get_locale(VutuvWeb.Gettext) in ~w(de it), do: {".", ","}, else: {",", "."}
+    case Gettext.get_locale(VutuvWeb.Gettext) do
+      "fr" -> {" ", ","}
+      locale when locale in ~w(de it) -> {".", ","}
+      _english -> {",", "."}
+    end
   end
 
   @doc """
@@ -4259,6 +4341,7 @@ defmodule VutuvWeb.UI do
   # not a Gettext string because this runs outside a request in the agent
   # formats, where the process locale is not the reader's.
   defp relative_yesterday("de"), do: "Gestern"
+  defp relative_yesterday("fr"), do: "Hier"
   defp relative_yesterday("it"), do: "Ieri"
   defp relative_yesterday(_), do: "Yesterday"
 
@@ -4310,6 +4393,7 @@ defmodule VutuvWeb.UI do
   Guard visibility (`:if={owner and frozen}`) at the call site.
   """
   attr(:class, :any, default: nil)
+  attr(:rest, :global)
   slot(:inner_block, required: true)
 
   def frozen_banner(assigns) do
@@ -4320,6 +4404,7 @@ defmodule VutuvWeb.UI do
         "flex flex-wrap items-center gap-1.5 bg-amber-50 font-semibold text-amber-800 ring-1 ring-amber-200 dark:bg-amber-900/30 dark:text-amber-200 dark:ring-amber-900",
         @class
       ]}
+      {@rest}
     >
       <span aria-hidden="true">⚑</span>
       {render_slot(@inner_block)}
@@ -5438,6 +5523,9 @@ defmodule VutuvWeb.UI do
   defp detail_icon_path("lock"),
     do:
       "M16.5 10.5V6.75a4.5 4.5 0 1 0-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 0 0 2.25-2.25v-6.75a2.25 2.25 0 0 0-2.25-2.25H6.75a2.25 2.25 0 0 0-2.25 2.25v6.75a2.25 2.25 0 0 0 2.25 2.25Z"
+
+  # A link that leaves the site (the profile address card's map link).
+  defp detail_icon_path("arrow-up-right"), do: "m4.5 19.5 15-15m0 0H8.25m11.25 0v11.25"
 
   @doc """
   The grouped settings menu: the **one map** of everything a member can change

@@ -301,6 +301,45 @@ defmodule VutuvWeb.EmailComponents do
     """
   end
 
+  @doc """
+  The facts an ad invoice is written from, as one panel: the period, when it
+  was booked, where the invoice goes, and the money. German and unlocalised
+  like the rest of the operator notices - nobody but this installation's
+  operator ever receives them.
+
+  One component rather than a copy per notice, because all three (booking,
+  cancellation, withdrawal) answer the same question about money, and a
+  discount row that appeared in one of them and not the others is an invoice
+  written for the wrong amount. The `inner_block` is the one row each notice
+  differs in: who booked, who cancelled, who withdrew.
+  """
+  attr(:invoice, :map, required: true)
+  slot(:inner_block, required: true)
+
+  def email_invoice_facts(assigns) do
+    ~H"""
+    <.email_panel>
+      <.email_row label="Zeitraum">
+        {@invoice.period}<span :if={@invoice.days > 1}> ({@invoice.days} Tage)</span>
+      </.email_row>
+      <.email_row :if={@invoice.booked_at} label="Gebucht am">{@invoice.booked_at}</.email_row>
+      <.email_row label="Rechnung an">{@invoice.recipient}</.email_row>
+      {render_slot(@inner_block)}
+      <.email_row :if={@invoice.discount} label="Listenpreis">{@invoice.price} EUR</.email_row>
+      <.email_row :if={@invoice.discount} label="Rabatt">
+        −{@invoice.discount.amount} EUR (Code {@invoice.discount.code})
+      </.email_row>
+      <.email_row label="Netto">
+        <strong>{@invoice.net} EUR</strong>
+      </.email_row>
+      <.email_row :if={@invoice.vat_percent > 0} label={"MwSt. (#{@invoice.vat_percent} %)"}>
+        {@invoice.vat} EUR
+      </.email_row>
+      <.email_row :if={@invoice.vat_percent > 0} label="Brutto">{@invoice.gross} EUR</.email_row>
+    </.email_panel>
+    """
+  end
+
   @doc "A bulleted list, e.g. the security-alert reasons."
   attr(:items, :list, required: true)
 
@@ -392,9 +431,11 @@ defmodule VutuvWeb.EmailComponents do
   end
 
   defp signature_line1("de"), do: "Viele Grüße"
+  defp signature_line1("fr"), do: "Cordialement"
   defp signature_line1("it"), do: "Cordiali saluti"
   defp signature_line1(_), do: "Regards"
   defp signature_line2("de"), do: "Ihr vutuv Team"
+  defp signature_line2("fr"), do: "L'équipe vutuv"
   defp signature_line2("it"), do: "Il team di vutuv"
   defp signature_line2(_), do: "The vutuv team"
 
@@ -411,6 +452,15 @@ defmodule VutuvWeb.EmailComponents do
     <.email_muted>
       Diese Benachrichtigungs-E-Mails können Sie
       <.email_link href={@unsubscribe_url}>hier abschalten</.email_link>.
+    </.email_muted>
+    """
+  end
+
+  def email_unsubscribe_note(%{locale: "fr"} = assigns) do
+    ~H"""
+    <.email_muted>
+      Vous pouvez désactiver ces e-mails de notification
+      <.email_link href={@unsubscribe_url}>ici</.email_link>.
     </.email_muted>
     """
   end

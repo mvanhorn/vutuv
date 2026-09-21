@@ -22,6 +22,7 @@ defmodule VutuvWeb.WelcomeControllerTest do
 
   alias Vutuv.Accounts
   alias Vutuv.Accounts.User
+  alias Vutuv.Ads
   alias Vutuv.Profiles.Address
 
   defp address_of(user), do: Repo.one(from(a in Address, where: a.user_id == ^user.id))
@@ -177,17 +178,22 @@ defmodule VutuvWeb.WelcomeControllerTest do
       refute conn |> get(~p"/#{user}") |> html_response(200) =~ ~s(id="welcome-modal")
     end
 
-    # The daily ad strip would sit behind the dimmed backdrop and still burn
-    # the member's hourly slot on a sighting they cannot read. /community is a
-    # plain controller page and carries the banner otherwise, so this goes red
-    # the moment VutuvWeb.Plug.AdBanner stops asking.
-    test "no ad banner rides along behind it", %{conn: conn} do
-      {conn, _user} = register_and_confirm(conn)
+    # The daily ad would sit behind the dimmed backdrop and still take the
+    # member's hour on a sighting they cannot read. A profile carries the ad
+    # otherwise, so this goes red the moment VutuvWeb.AdServing stops asking.
+    # The account is aged past the ad system's two-week grace period, or that
+    # rule would answer instead and this would pass either way — and the aged
+    # account is the real shape, since `:welcome_pending` is dropped only when
+    # the questions are answered or closed and the session cookie lives 90
+    # days, so somebody who ignores the window still carries it on day 20.
+    test "no ad rides along behind it", %{conn: conn} do
+      {conn, user} = register_and_confirm(conn)
+      backdate_registration!(user, Ads.grace_days() + 1)
 
-      body = conn |> get(~p"/community") |> html_response(200)
+      body = conn |> get(~p"/#{user}") |> html_response(200)
 
       assert body =~ ~s(id="welcome-modal")
-      refute body =~ ~s(id="vutuv-ad")
+      refute body =~ "ad-slot"
     end
 
     test "an ordinary login never gets it", %{conn: conn} do

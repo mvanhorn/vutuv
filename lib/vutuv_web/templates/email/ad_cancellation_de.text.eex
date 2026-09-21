@@ -1,0 +1,19 @@
+Stornierung einer Anzeigenbuchung
+=================================
+
+<%= render "_ad_invoice_de.text", %{invoice: @invoice} %>
+
+Storniert von @<%= @booker.username %> (<%= @url %><%= @booker.username %>),
+bevor die Anzeige freigeschaltet war. Der Zeitraum ist wieder frei.
+
+Anzeige
+-------
+Titel: <%= @ad.title %>
+Text:  <%= @ad.body %>
+Link:  <%= @ad.url %>
+
+Rechnungsadresse
+----------------
+<%= @billing_address %>
+
+Falls die Rechnung schon verschickt ist, bitte gutschreiben.

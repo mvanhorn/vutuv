@@ -1,0 +1,532 @@
+defmodule VutuvWeb.AdBookingLiveTest do
+  @moduledoc """
+  The three-step booking wizard at `/system/ads/new`.
+
+  What each test is about is the step it pins: the ad drawn from what is being
+  typed, a calendar that works in the block being bought, and a booking that is
+  the same purchase `Vutuv.Ads` makes from anywhere else.
+  """
+  use VutuvWeb.ConnCase, async: true
+
+  import Phoenix.LiveViewTest
+  import Vutuv.MailboxHelpers
+
+  alias Vutuv.Ads
+  alias Vutuv.Ads.Ad
+  alias Vutuv.Repo
+
+  @text %{
+    "title" => "Acme sucht Leute",
+    "body" => "Elixir in Mainz.",
+    "url" => "https://acme.example"
+  }
+
+  @billing %{
+    "billing_name" => "Acme GmbH",
+    "billing_street" => "Musterstraße 1",
+    "billing_zip_code" => "10115",
+    "billing_city" => "Berlin",
+    "billing_country" => "Deutschland"
+  }
+
+  # The wizard, and the signed-in conn it was reached with - a second visit in
+  # the same test has to carry that session, not the bare conn.
+  defp logged_in(conn) do
+    {conn, user} = create_and_login_user(conn)
+    {:ok, view, _html} = live(conn, ~p"/system/ads/new")
+    {view, user, conn}
+  end
+
+  # Step 1 -> step 2 -> a picked day, which is where most tests start.
+  defp at_period(view, days \\ 1) do
+    render_submit(element(view, "#ad-text-form"), %{"ad" => @text})
+    if days != 1, do: render_click(element(view, "button[phx-value-days='#{days}']"))
+    view
+  end
+
+  defp pick(view, %Date{} = day) do
+    render_click(element(view, "button[phx-value-day='#{Date.to_iso8601(day)}']"))
+    view
+  end
+
+  describe "who may book" do
+    test "a visitor is sent away", %{conn: conn} do
+      assert {:error, {:redirect, %{to: to}}} = live(conn, ~p"/system/ads/new")
+      assert to == "/login"
+    end
+  end
+
+  describe "step 1: writing the ad" do
+    test "the card is drawn from what is being typed, before it is valid", %{conn: conn} do
+      {view, _user, _conn} = logged_in(conn)
+
+      html =
+        render_change(element(view, "#ad-text-form"), %{
+          "ad" => %{"title" => "Halb getippt", "body" => "", "url" => ""}
+        })
+
+      # The preview is the real card component, so what a buyer checks here is
+      # what a profile will draw.
+      assert html =~ "Halb getippt"
+      assert has_element?(view, "#wizard-preview")
+    end
+
+    test "the preview shows all three lines, the address included", %{conn: conn} do
+      {view, _user, _conn} = logged_in(conn)
+
+      html = render_change(element(view, "#ad-text-form"), %{"ad" => @text})
+
+      preview =
+        LazyHTML.from_fragment(html) |> LazyHTML.query("#wizard-preview") |> LazyHTML.text()
+
+      # The address under the sentence is the third line of the format and the
+      # one that tells a reader where the link goes - it has to be in what the
+      # buyer is shown.
+      assert preview =~ @text["title"]
+      assert preview =~ @text["body"]
+      assert preview =~ "acme.example"
+    end
+
+    test "with no link yet, the preview says where the address will be", %{conn: conn} do
+      {view, _user, _conn} = logged_in(conn)
+
+      html =
+        render_change(element(view, "#ad-text-form"), %{
+          "ad" => %{"title" => "Apfelmus", "body" => "Bestes Apfelmus ever.", "url" => ""}
+        })
+
+      # An absent third line reads as a broken preview rather than as an empty
+      # field, so the card says which line is still to come.
+      assert html =~ "The address under the sentence appears"
+
+      html = render_change(element(view, "#ad-text-form"), %{"ad" => @text})
+      refute html =~ "The address under the sentence appears"
+    end
+
+    test "all three fields reach the preview at the same speed", %{conn: conn} do
+      {view, _user, _conn} = logged_in(conn)
+      html = render(view)
+
+      # The address used to lag the other two by a whole debounce, so the card
+      # read as a two-line card for a third of a second after every keystroke.
+      debounces =
+        html
+        |> LazyHTML.from_fragment()
+        |> LazyHTML.query("#ad-text-form input[phx-debounce]")
+        |> Enum.map(&(&1 |> LazyHTML.attribute("phx-debounce") |> List.first()))
+
+      assert length(debounces) == 3
+      assert Enum.uniq(debounces) |> length() == 1
+    end
+
+    test "an address without its scheme says so while it is being typed", %{conn: conn} do
+      {view, _user, _conn} = logged_in(conn)
+
+      html =
+        render_change(element(view, "#ad-text-form"), %{
+          "ad" => %{@text | "url" => "stefans-gummibaerchen.de"}
+        })
+
+      # The message names the fix, not the verdict, and it arrives on the
+      # keystroke rather than at the end of the wizard. Asserted on the words
+      # around the schemes, because the field's own placeholder is "https://".
+      assert html =~ "Please start the address with"
+      assert has_element?(view, "#ad-url.border-red-400")
+    end
+
+    test "an empty field nobody has reached does not complain yet", %{conn: conn} do
+      {view, _user, _conn} = logged_in(conn)
+
+      html =
+        render_change(element(view, "#ad-text-form"), %{
+          "ad" => %{"title" => "Erst der Titel", "body" => "", "url" => ""}
+        })
+
+      refute html =~ "can&#39;t be blank"
+      refute html =~ "darf nicht leer sein"
+    end
+
+    test "a good address passes without a word", %{conn: conn} do
+      {view, _user, _conn} = logged_in(conn)
+
+      html = render_change(element(view, "#ad-text-form"), %{"ad" => @text})
+
+      refute html =~ "Please start the address with"
+    end
+
+    test "an incomplete ad does not reach the calendar", %{conn: conn} do
+      {view, _user, _conn} = logged_in(conn)
+
+      render_submit(element(view, "#ad-text-form"), %{"ad" => %{@text | "url" => "not a url"}})
+
+      assert has_element?(view, "#ad-text-form")
+      refute has_element?(view, "#ad-calendar")
+    end
+
+    test "a finished ad opens the calendar", %{conn: conn} do
+      {view, _user, _conn} = logged_in(conn)
+      at_period(view)
+
+      assert has_element?(view, "#ad-calendar")
+    end
+  end
+
+  describe "saved ads" do
+    test "the shortcut is on the page before anything has been saved", %{conn: conn} do
+      {view, _user, _conn} = logged_in(conn)
+
+      # Visible while empty, or nobody finds out it exists.
+      assert render(view) =~ "Your saved ads"
+    end
+
+    test "an ad can be saved, used again and forgotten", %{conn: conn} do
+      {view, user, conn} = logged_in(conn)
+
+      render_change(element(view, "#ad-text-form"), %{"ad" => @text})
+      render_click(element(view, "button[phx-click='save-text']"))
+
+      assert [creative] = Ads.list_creatives(user)
+      assert creative.title == @text["title"]
+
+      # A fresh wizard offers it, and picking it fills the form in.
+      {:ok, second, _html} = live(conn, ~p"/system/ads/new")
+      html = render_click(element(second, "button[phx-click='use-creative']"))
+      assert html =~ @text["title"]
+
+      render_click(element(second, "button[phx-click='forget-creative']"))
+      assert Ads.list_creatives(user) == []
+    end
+
+    test "saving does not tie a booking to the saved copy", %{conn: conn} do
+      {view, user, conn} = logged_in(conn)
+
+      render_change(element(view, "#ad-text-form"), %{"ad" => @text})
+      render_click(element(view, "button[phx-click='save-text']"))
+      assert [creative] = Ads.list_creatives(user)
+
+      book(view, Ads.next_available_day())
+      assert %Ad{} = ad = Repo.one(Ad)
+
+      # Editing the saved ad afterwards must not reach into what was booked -
+      # the booking carries its own copy, which is what an invoice was written
+      # against.
+      {:ok, _} = Ads.save_creative(user, %{@text | "title" => "Ganz anders"}, creative)
+      assert Repo.get!(Ad, ad.id).title == @text["title"]
+    end
+  end
+
+  describe "step 2: the calendar" do
+    test "it shows this month and the next three", %{conn: conn} do
+      {view, _user, _conn} = logged_in(conn)
+      at_period(view)
+
+      assert length(elements(render(view), "[data-calendar-month]")) == 4
+    end
+
+    test "a booked day cannot be picked", %{conn: conn} do
+      taken = Ads.next_available_day()
+      insert(:ad, day: taken)
+      {view, _user, _conn} = logged_in(conn)
+      at_period(view)
+
+      refute has_element?(view, "button[phx-value-day='#{Date.to_iso8601(taken)}']")
+    end
+
+    test "with a week chosen, only days with seven free behind them may start it", %{conn: conn} do
+      first = Ads.next_available_day()
+      # A single taken day four days out blocks every start that would span it.
+      insert(:ad, day: Date.add(first, 4))
+      {view, _user, _conn} = logged_in(conn)
+      at_period(view, 7)
+
+      refute has_element?(view, "button[phx-value-day='#{Date.to_iso8601(first)}']")
+      assert has_element?(view, "button[phx-value-day='#{Date.to_iso8601(Date.add(first, 5))}']")
+    end
+
+    test "picking a start marks the whole stretch, not one day", %{conn: conn} do
+      first = Ads.next_available_day()
+      {view, _user, _conn} = logged_in(conn)
+
+      view |> at_period(7) |> pick(first)
+      html = render(view)
+
+      for offset <- 0..6 do
+        day = Date.to_iso8601(Date.add(first, offset))
+        assert html =~ ~s(data-day="#{day}")
+        assert length(elements(html, ~s([data-day="#{day}"][aria-pressed="true"]))) == 1
+      end
+
+      refute html =~ ~s([data-day="#{Date.to_iso8601(Date.add(first, 7))}" aria-pressed="true")
+    end
+
+    test "changing the length drops a start it no longer fits", %{conn: conn} do
+      first = Ads.next_available_day()
+      insert(:ad, day: Date.add(first, 3))
+      {view, _user, _conn} = logged_in(conn)
+
+      view |> at_period(1) |> pick(first)
+      assert render(view) =~ "aria-pressed=\"true\""
+
+      # Seven days no longer fit behind that start, so the selection goes
+      # rather than quietly booking a stretch nobody picked.
+      render_click(element(view, "button[phx-value-days='7']"))
+      refute has_element?(view, "[data-day][aria-pressed='true']")
+    end
+
+    test "the calendar cannot be skipped", %{conn: conn} do
+      {view, _user, _conn} = logged_in(conn)
+      at_period(view)
+
+      # The way on is not merely ignored, it is not offered: nothing here says
+      # which days were picked, so a press that did nothing would read as broken.
+      assert has_element?(view, "button[phx-click='to-billing'][disabled]")
+      refute has_element?(view, "#ad-billing-form")
+    end
+  end
+
+  describe "step 3: booking" do
+    test "a week is booked as one purchase and mailed once", %{conn: conn} do
+      first = Ads.next_available_day()
+      {view, user, conn} = logged_in(conn)
+
+      view |> at_period(7) |> pick(first)
+      render_click(element(view, "button[phx-click='to-billing']"))
+
+      assert {:error, {:live_redirect, %{to: to}}} =
+               render_submit(element(view, "#ad-billing-form"), %{"ad" => @billing})
+
+      assert to == ~p"/system/ads/bookings"
+
+      rows = Repo.all(Ad)
+      assert length(rows) == 7
+      assert [group] = rows |> Enum.map(& &1.group_id) |> Enum.uniq()
+      assert is_binary(group)
+      assert Enum.sum(Enum.map(rows, & &1.price_cents)) == 200_000
+      assert Enum.all?(rows, &(&1.user_id == user.id))
+      assert Enum.all?(rows, &(&1.title == @text["title"]))
+
+      # One purchase, so the operator and the booker hear once each.
+      assert length(flush_emails()) == 2
+    end
+
+    test "a day taken while the invoice was typed sends them back to the calendar", %{conn: conn} do
+      first = Ads.next_available_day()
+      {view, _user, _conn} = logged_in(conn)
+
+      view |> at_period(1) |> pick(first)
+      render_click(element(view, "button[phx-click='to-billing']"))
+
+      # Somebody else books it in the meantime.
+      insert(:ad, day: first)
+
+      html = render_submit(element(view, "#ad-billing-form"), %{"ad" => @billing})
+
+      assert html =~ "id=\"booking-error\""
+      assert has_element?(view, "#ad-calendar")
+      # And the calendar now shows it as taken, so the same day cannot be
+      # picked a second time.
+      refute has_element?(view, "button[phx-value-day='#{Date.to_iso8601(first)}']")
+    end
+
+    test "a missing invoice field keeps them on the last step", %{conn: conn} do
+      {view, _user, _conn} = logged_in(conn)
+
+      view |> at_period(1) |> pick(Ads.next_available_day())
+      render_click(element(view, "button[phx-click='to-billing']"))
+
+      render_submit(element(view, "#ad-billing-form"), %{
+        "ad" => Map.delete(@billing, "billing_street")
+      })
+
+      assert has_element?(view, "#ad-billing-form")
+      assert Repo.aggregate(Ad, :count) == 0
+      assert flush_emails() == []
+    end
+
+    test "the two reservations are said on the step where the money is agreed to", %{conn: conn} do
+      {view, _user, _conn} = logged_in(conn)
+
+      view |> at_period(1) |> pick(Ads.next_available_day())
+      html = render_click(element(view, "button[phx-click='to-billing']"))
+
+      # Both are promises about what we may do with somebody's money, so they
+      # belong where they agree to it, not in a page of terms elsewhere.
+      assert html =~ "may turn a booking down"
+      assert html =~ "not paid"
+    end
+
+    test "the invoice goes to an address the member picked", %{conn: conn} do
+      # The addresses are read at mount, so the second one has to exist first.
+      {conn, user} = create_and_login_user(conn)
+      second = "rechnung-#{System.unique_integer([:positive])}@example.com"
+      insert(:email, user: user, value: second)
+      {:ok, view, _html} = live(conn, ~p"/system/ads/new")
+
+      view |> at_period(1) |> pick(Ads.next_available_day())
+      html = render_click(element(view, "button[phx-click='to-billing']"))
+
+      # Two addresses, so there is something to choose.
+      assert html =~ second
+      assert length(elements(html, "input[name='ad[invoice_email]']")) == 2
+
+      render_submit(element(view, "#ad-billing-form"), %{
+        "ad" => Map.put(@billing, "invoice_email", second)
+      })
+
+      assert %Ad{invoice_email: ^second} = Repo.one(Ad)
+
+      # And the operator mail, which the invoice is written from, names it.
+      assert Enum.any?(flush_emails(), &(&1.text_body =~ second))
+    end
+
+    test "an address that is not the member's own falls back to their first", %{conn: conn} do
+      {view, user, _conn} = logged_in(conn)
+
+      view |> at_period(1) |> pick(Ads.next_available_day())
+      render_click(element(view, "button[phx-click='to-billing']"))
+
+      # A form field is not an allow-list: a tampered value may only ever reach
+      # the member themselves, never somebody else's mailbox.
+      render_submit(element(view, "#ad-billing-form"), %{
+        "ad" => Map.put(@billing, "invoice_email", "angreifer@example.com")
+      })
+
+      assert %Ad{invoice_email: chosen} = Repo.one(Ad)
+      assert chosen == Vutuv.Accounts.first_email_value(user)
+      refute chosen == "angreifer@example.com"
+    end
+
+    test "a second booking meets the invoice address already filled in", %{conn: conn} do
+      {view, _user, conn} = logged_in(conn)
+      book(view, Ads.next_available_day())
+
+      {:ok, second, _html} = live(conn, ~p"/system/ads/new")
+      second |> at_period(1) |> pick(Date.add(Ads.next_available_day(), 1))
+      html = render_click(element(second, "button[phx-click='to-billing']"))
+
+      assert html =~ "Musterstraße 1"
+    end
+  end
+
+  describe "a reload in the middle" do
+    test "the whole wizard comes back, down to the picked day", %{conn: conn} do
+      first = Ads.next_available_day()
+      {view, _user, conn} = logged_in(conn)
+
+      at_billing(view, first)
+      render_change(element(view, "#ad-billing-form"), %{"ad" => @billing})
+
+      # What the browser keeps is what the page rendered for it, so the test
+      # travels the same road a stray pull does: read it out, throw the wizard
+      # away, hand it to a fresh one.
+      draft = stored_draft(view)
+      {:ok, second, _html} = live(conn, ~p"/system/ads/new")
+      html = restore(second, draft)
+
+      assert has_element?(second, "#ad-billing-form")
+      assert has_element?(second, "#draft-restored")
+      assert html =~ @text["title"]
+      assert html =~ "Musterstraße 1"
+
+      # And it is a booking, not a picture of one: the day it came back with
+      # is the day that gets booked.
+      render_submit(element(second, "#ad-billing-form"), %{"ad" => @billing})
+      assert %Ad{day: ^first, title: title} = Repo.one(Ad)
+      assert title == @text["title"]
+    end
+
+    test "a wizard nobody has written in keeps nothing", %{conn: conn} do
+      {view, _user, _conn} = logged_in(conn)
+
+      # An empty draft is also what a reconnect's fresh mount renders, and it
+      # must never be the thing that overwrites a saved one.
+      assert stored_draft(view) == ""
+
+      render_change(element(view, "#ad-text-form"), %{"ad" => @text})
+      assert stored_draft(view)["title"] == @text["title"]
+    end
+
+    test "a day booked while the page was away is not handed back", %{conn: conn} do
+      first = Ads.next_available_day()
+      {view, _user, conn} = logged_in(conn)
+
+      draft = view |> at_billing(first) |> stored_draft()
+
+      insert(:ad, day: first)
+      {:ok, second, _html} = live(conn, ~p"/system/ads/new")
+      restore(second, draft)
+
+      # The ad survives, the day does not - so they land on the calendar
+      # rather than on an invoice for a day that is gone.
+      assert has_element?(second, "#ad-calendar")
+      refute has_element?(second, "#ad-billing-form")
+      refute has_element?(second, "button[phx-value-day='#{Date.to_iso8601(first)}']")
+    end
+
+    test "somebody else's draft is not restored", %{conn: conn} do
+      {view, _user, conn} = logged_in(conn)
+      draft = view |> at_billing(Ads.next_available_day()) |> stored_draft()
+
+      # Two members, one tab: the draft names whose writing it is, and a name
+      # that is not this member's carries an invoice address that is not
+      # theirs to read.
+      {:ok, second, _html} = live(conn, ~p"/system/ads/new")
+      restore(second, %{draft | "user" => Vutuv.UUIDv7.generate()})
+
+      assert has_element?(second, "#ad-text-form")
+      refute has_element?(second, "#ad-billing-form")
+      refute render(second) =~ @text["title"]
+    end
+
+    test "starting over empties the browser's copy too", %{conn: conn} do
+      {view, _user, conn} = logged_in(conn)
+      view |> at_period(1) |> pick(Ads.next_available_day())
+      draft = stored_draft(view)
+
+      {:ok, second, _html} = live(conn, ~p"/system/ads/new")
+      restore(second, draft)
+      html = render_click(element(second, "button[phx-click='discard-draft']"))
+
+      # Otherwise the next reload brings back exactly what they just threw
+      # away.
+      assert_push_event(second, "ad-draft:clear", %{})
+      refute html =~ @text["title"]
+      assert has_element?(second, "#ad-text-form")
+    end
+  end
+
+  # Text, day, invoice, confirm - the whole wizard, for the tests that need a
+  # booking to exist rather than to watch one being made.
+  defp book(view, day) do
+    view |> at_period(1) |> pick(day)
+    render_click(element(view, "button[phx-click='to-billing']"))
+    render_submit(element(view, "#ad-billing-form"), %{"ad" => @billing})
+    flush_emails()
+  end
+
+  # What the browser would have kept: the wizard renders its state into the
+  # element the hook mirrors into sessionStorage.
+  defp stored_draft(view) do
+    raw =
+      render(view)
+      |> elements("#ad-draft")
+      |> List.first()
+      |> attribute("data-draft")
+
+    if raw == "", do: "", else: Jason.decode!(raw)
+  end
+
+  # Step 1 -> step 2 -> a picked day -> the invoice, which is where a draft
+  # worth losing exists.
+  defp at_billing(view, day) do
+    view |> at_period(1) |> pick(day)
+    render_click(element(view, "button[phx-click='to-billing']"))
+    view
+  end
+
+  # The reload, from the wizard's side: a page that starts empty, handed what
+  # the browser had.
+  defp restore(view, draft) do
+    render_hook(element(view, "#ad-draft"), "restore-draft", draft)
+  end
+end

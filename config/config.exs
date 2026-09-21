@@ -24,7 +24,7 @@ config :vutuv, VutuvWeb.Endpoint,
   # Signs the LiveView session token exchanged over the /live socket. Distinct
   # from secret_key_base and from the Plug.Session signing_salt.
   live_view: [signing_salt: "PHEbY7u44Jfd3Ei0"],
-  locales: ~w(en de it),
+  locales: ~w(en de fr it),
   max_page_items: 250
 
 config :logger, :console,
@@ -364,10 +364,18 @@ config :vutuv, :welcome_suggestions, %{
 }
 
 # The global on/off switch for the daily text-ad system (see Vutuv.Ads).
-# Off for now: no banner serves, the public /ads flow and the admin review
-# dashboard 404. "ads" stays a reserved username slug either way, so the
-# handle is kept free for when the system is switched back on.
+# Off unless an installation asks for it with ADS_ENABLED=true (runtime.exs):
+# no ad serves, the public /system/ads flow and the admin review dashboard 404.
+# "ads" stays a reserved username slug either way, so the handle is kept free.
+# The shipped default stays off because the prices and the German operator
+# notices are ours, not every installation's.
 config :vutuv, :ads_enabled, false
+
+# The VAT rate the operator adds on top of every quoted ad price, in percent
+# (ADS_VAT_PERCENT). Every price in the ad system is net; 19 is the German rate
+# vutuv.de invoices at, an installation elsewhere sets its own, and 0 drops the
+# VAT line from the offer page, the booking form and both mails.
+config :vutuv, :ads_vat_percent, 19
 
 # Where this installation's data physically lives, named on the start page's
 # privacy section ("on our own servers in Deutschland, not in somebody else's
@@ -606,6 +614,10 @@ config :vutuv, :fediverse_max_remote_follows, 1_000
 # tests, same sandbox reasoning; tests call
 # Vutuv.AccountEvents.delete_expired/0 directly).
 config :vutuv, :sweep_account_events, true
+
+# Whether the daily GenServer that forgets a member's seen ads after 90 days
+# runs (Vutuv.Ads.SightingSweeper; off in tests, same sandbox reasoning).
+config :vutuv, :sweep_ad_sightings, true
 
 # Whether the daily GenServer that clears abandoned OAuth client registrations
 # and spent authorization codes runs (off in tests, same sandbox reasoning;

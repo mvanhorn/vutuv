@@ -841,11 +841,9 @@ defmodule VutuvWeb.SettingsController do
     reset_prefs(conn, :region, gettext("Date and time settings reset to the site defaults."))
   end
 
-  # Map preferences (which map services to show on addresses and which is the
-  # default) are a viewing preference, not public profile content, so they sit
-  # on the language & display page. The form posts the three enable checkboxes
-  # plus the default select; `Vutuv.Maps` reconciles a default that points at
-  # a disabled service at render time, so no extra validation here.
+  # Map preferences (which map service an address links to, or none) are a
+  # viewing preference, not public profile content, so they sit on the
+  # language & display page.
   def update_maps(conn, %{"user" => params}) do
     save(
       conn,
