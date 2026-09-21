@@ -156,7 +156,7 @@ defmodule VutuvWeb.Fediverse.Docs do
       "type" => Vutuv.Identity.ap_type(user),
       "preferredUsername" => user.username,
       "name" => UserHelpers.full_name(user),
-      "summary" => summary(user),
+      "summary" => markdown_summary(user.headline),
       "url" => "#{base()}/#{user.username}",
       # Count-only like the followers collection, and for the same reason: who
       # a member reads is theirs to know (issue #1160). Always advertised, so a
@@ -305,30 +305,16 @@ defmodule VutuvWeb.Fediverse.Docs do
       # `Fediverse.federated?/1` refuses a page that has not claimed one.
       "preferredUsername" => organization.username,
       "name" => organization.name,
-      "summary" => organization_summary(organization),
+      "summary" => markdown_summary(organization.description),
       "url" => "#{base()}/organizations/#{organization.slug}"
     })
     |> put_organization_icon(organization)
   end
 
-  # A page's description is Markdown, and `summary` is HTML — the first cut put
-  # the stored source straight on the wire, so a bio written with a link or a
-  # list travelled as its own markup characters, unescaped and unwrapped. It
-  # goes through the renderer the page itself uses (`<.markdown_prose>`), so
-  # what a remote server shows is what a visitor here reads, and through the
-  # same absolutizer the post bodies use, because a root-relative `/handle`
-  # means nothing on another server. The member half already did this with its
-  # headline (`summary/1`), plainer only because a headline is one line of text.
-  defp organization_summary(%Organization{description: description})
-       when description in [nil, ""],
-       do: ""
-
-  defp organization_summary(%Organization{description: description}) do
-    description
-    |> VutuvWeb.Markdown.render()
-    |> Phoenix.HTML.safe_to_string()
-    |> absolutize()
-  end
+  # A page's description and a member's headline are Markdown, and `summary` is
+  # HTML: rendered the way their own page renders them, so a remote server
+  # shows what a visitor here reads rather than the markup characters.
+  defp markdown_summary(text), do: VutuvWeb.Markdown.render_absolute(text, base())
 
   # The page's logo, which is the avatar a remote server shows beside its name.
   # Rendered only when there is one: the document is a promise to strangers, and
@@ -804,9 +790,14 @@ defmodule VutuvWeb.Fediverse.Docs do
   # is deliberately not here: on vutuv a member names somebody by typing `@ada`,
   # which `content_html/3` already spells out in full on the wire, so prepending
   # a handle they never typed would put words in their post.
-  defp answered_actors(nil), do: []
+  @doc """
+  The accounts of ours a `reply_parent/1` answer names, as a list: its author
+  when they federate, else nobody. The Note's `cc` and `Mention` read it, and so
+  does `Vutuv.Fediverse.recipients/2` for whose followers also get the answer.
+  """
+  def answered_actors(nil), do: []
 
-  defp answered_actors({author, _parent_post_id}),
+  def answered_actors({author, _parent_post_id}),
     do: Enum.filter([author], &Vutuv.Fediverse.federated?/1)
 
   # One spelling of the `Mention` an account of ours becomes, shared by the two
@@ -1093,8 +1084,14 @@ defmodule VutuvWeb.Fediverse.Docs do
   defp put_in_reply_to(note, {parent_author, parent_id}),
     do: Map.put(note, "inReplyTo", note_url(parent_author, parent_id))
 
-  defp reply_parent(%Post{reply_ref: %Ecto.Association.NotLoaded{}}), do: nil
-  defp reply_parent(%Post{reply_ref: nil}), do: nil
+  @doc """
+  The vutuv post this one publicly answers, as `{parent_author, parent_id}`, or
+  nil: not an answer, a parent that is gone or no longer public, or an
+  un-preloaded `reply_ref` (`note_preloads/0` loads it). The author is a member
+  or a page, whether or not they federate.
+  """
+  def reply_parent(%Post{reply_ref: %Ecto.Association.NotLoaded{}}), do: nil
+  def reply_parent(%Post{reply_ref: nil}), do: nil
 
   # Read off the ref rather than through `Posts.reply_ref_state/1`, which owns
   # this question for the renderers: a Note wants the parent's id and author and
@@ -1112,7 +1109,7 @@ defmodule VutuvWeb.Fediverse.Docs do
   # answer. Accepted: both halves of the fix need its answer, and preloading the
   # parent's denials instead trades one `exists?` for two preload queries on the
   # path that dominates, a single post's note.
-  defp reply_parent(%Post{reply_ref: reply_ref}) do
+  def reply_parent(%Post{reply_ref: reply_ref}) do
     with parent_id when is_binary(parent_id) <- reply_ref.parent_post_id,
          author when not is_nil(author) <- parent_author(reply_ref),
          false <- Posts.restricted?(%Post{id: parent_id}) do
@@ -1217,20 +1214,6 @@ defmodule VutuvWeb.Fediverse.Docs do
   end
 
   defp cover_attachments(%Post{}), do: []
-
-  defp summary(user) do
-    case user.headline do
-      nil ->
-        ""
-
-      "" ->
-        ""
-
-      headline ->
-        "<p>" <>
-          (headline |> Phoenix.HTML.html_escape() |> Phoenix.HTML.safe_to_string()) <> "</p>"
-    end
-  end
 
   defp iso8601(%NaiveDateTime{} = at),
     do: at |> NaiveDateTime.truncate(:second) |> NaiveDateTime.to_iso8601() |> Kernel.<>("Z")
